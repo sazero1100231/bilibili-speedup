@@ -19,12 +19,12 @@ Chrome or Edge 120 or later is required.
 1. Download and extract this repository.
 2. Open `chrome://extensions` or `edge://extensions`.
 3. Enable **Developer mode**.
-4. Choose **Load unpacked** and select the `release` folder.
+4. Choose **Load unpacked** and select the `release-en` folder (English UI). The `release` folder ships the same build with a Traditional Chinese UI.
 
 ## Privacy
 
 - Settings and diagnostics stay in local browser storage and are never uploaded automatically.
-- Diagnostics are enabled by default and record playback page URLs plus performance and CDN data. They can be disabled or cleared at any time.
+- Diagnostics are disabled by default. Once enabled, they record playback page URLs plus performance and CDN data, and can be disabled or cleared at any time.
 - Exported diagnostic JSON may contain playback page URLs and media identifiers. Redact it before sharing.
 
 ## Development

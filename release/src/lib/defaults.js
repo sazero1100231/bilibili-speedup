@@ -27,7 +27,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
     }
   },
   diagnostics: {
-    enabled: true,
+    enabled: false,
     maxSessions: 500
   }
 });

@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "Bilibili Overseas Playback Speedup and Tracking Cleaner",
+  "short_name": "Bili Overseas Speedup",
+  "version": "1.1.17",
+  "description": "Uses local CDN node probing, playurl rewriting, and tracking cleanup to improve Bilibili overseas playback.",
+  "permissions": [
+    "declarativeNetRequest",
+    "storage",
+    "scripting"
+  ],
+  "host_permissions": [
+    "*://*.bilibili.com/*",
+    "https://*.bilivideo.com/*",
+    "https://upos-hz-mirrorakam.akamaized.net/*",
+    "https://*.bilivideo.cn/*",
+    "*://b23.tv/*"
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'"
+  },
+  "background": {
+    "service_worker": "src/background/service-worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Bili Overseas Speedup",
+    "default_popup": "src/ui/popup.html",
+    "default_icon": {
+      "128": "icons/icon-128.png"
+    }
+  },
+  "icons": {
+    "128": "icons/icon-128.png"
+  },
+  "options_page": "src/ui/options.html",
+  "minimum_chrome_version": "120"
+}

@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Bili Overseas Speedup — Diagnostics</title>
+    <link rel="stylesheet" href="common.css">
+  </head>
+  <body>
+    <main>
+      <h1>Diagnostics panel</h1>
+      <p class="lede">This page reads only local `chrome.storage.local`. Export produces a local JSON file only after you click the button.</p>
+
+      <section class="card">
+        <h2>Latest session</h2>
+        <div id="metrics" class="metrics"></div>
+      </section>
+
+      <section class="card">
+        <h2>Latest session: Presentation/Route details</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Presentation</th>
+                <th>Type</th>
+                <th>Representation route</th>
+                <th>Planned → Actual</th>
+                <th>Switches</th>
+                <th>Throughput</th>
+                <th>Buffer</th>
+                <th>Recovery</th>
+              </tr>
+            </thead>
+            <tbody id="routeRows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Latest session: Player details</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Player</th>
+                <th>Presentation</th>
+                <th>Route</th>
+                <th>Node</th>
+                <th>Waiting/Stalled</th>
+                <th>Buffer</th>
+                <th>Play seconds</th>
+              </tr>
+            </thead>
+            <tbody id="playerRows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="row">
+          <span>
+            <span class="label">CDN probe results</span>
+            <span id="probeMeta" class="description"></span>
+          </span>
+          <button id="refresh" type="button">Refresh</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Planned/Actual node</th>
+                <th>Status</th>
+                <th>TTFB</th>
+                <th>Throughput</th>
+                <th>HTTP</th>
+              </tr>
+            </thead>
+            <tbody id="probeRows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Play sessions</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Page</th>
+                <th>Node</th>
+                <th>Stalls</th>
+                <th>Buffering</th>
+                <th>First-play</th>
+                <th>Rewrite/Fallback/Degrade</th>
+              </tr>
+            </thead>
+            <tbody id="sessionRows"></tbody>
+          </table>
+        </div>
+        <div class="actions">
+          <button id="export" class="primary" type="button">Export JSON</button>
+          <button id="clear" type="button">Clear local measurements</button>
+        </div>
+        <p id="status" class="status" role="status"></p>
+      </section>
+    </main>
+    <script type="module" src="diagnostics.js"></script>
+  </body>
+</html>

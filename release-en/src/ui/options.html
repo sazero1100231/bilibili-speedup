@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Bili Overseas Speedup — Settings</title>
+    <link rel="stylesheet" href="common.css">
+  </head>
+  <body>
+    <main>
+      <h1>Bili Overseas Speedup</h1>
+      <p class="lede">All settings and measurements stay on this device only. Feature changes update the rules immediately; reload any open pages.</p>
+
+      <section class="card">
+        <div class="row">
+          <span>
+            <span class="label">Global enable</span>
+            <span class="description">Turning this off removes all DNR dynamic/tab rules and content-script registrations.</span>
+          </span>
+          <label class="switch">
+            <input id="globalEnabled" type="checkbox">
+            <span></span>
+          </label>
+        </div>
+      </section>
+
+      <div class="grid">
+        <section class="card">
+          <h2>Playback speedup</h2>
+          <div class="row">
+            <span>
+              <span class="label">Enable playback speedup</span>
+              <span class="description">Handles only the media URL of regular videos and bangumi; does not bypass regional limits.</span>
+            </span>
+            <label class="switch">
+              <input id="accelerationEnabled" type="checkbox">
+              <span></span>
+            </label>
+          </div>
+          <div class="row">
+            <span>
+              <span class="label">playurl JSON Rewrite</span>
+              <span class="description">MAIN world primary path; reorders baseUrl and backupUrl.</span>
+            </span>
+            <label class="switch">
+              <input id="playurlRewrite" type="checkbox">
+              <span></span>
+            </label>
+          </div>
+          <div class="row">
+            <span>
+              <span class="label">DNR network-layer fallback</span>
+              <span class="description">Per-tab fully signed URL routes poor m4s/flv/mp4 nodes.</span>
+            </span>
+            <label class="switch">
+              <input id="dnrFallback" type="checkbox">
+              <span></span>
+            </label>
+          </div>
+          <div class="row">
+            <label for="strategy">
+              <span class="label">Node strategy</span>
+              <span class="description">Auto mode probes using the real media path; manual mode keeps a fixed preferred node.</span>
+            </label>
+            <select id="strategy">
+              <option value="auto">Auto probe</option>
+              <option value="manual">Manual</option>
+            </select>
+          </div>
+          <div class="row">
+            <label for="manualHost">
+              <span class="label">Manual node</span>
+              <span class="description">Applies only in Manual mode.</span>
+            </label>
+            <select id="manualHost"></select>
+          </div>
+          <div class="row">
+            <label for="probeCacheMinutes">
+              <span class="label">Probe cache</span>
+              <span class="description">Caches each node result for 5–120 minutes.</span>
+            </label>
+            <input id="probeCacheMinutes" type="number" min="5" max="120">
+          </div>
+        </section>
+
+        <section class="card">
+          <h2>Tracking cleanup</h2>
+          <div class="row">
+            <span>
+              <span class="label">URL parameter cleaning</span>
+              <span class="description">Handles the address bar, SPA, page links, and share clipboard.</span>
+            </span>
+            <label class="switch">
+              <input id="urlCleaning" type="checkbox">
+              <span></span>
+            </label>
+          </div>
+          <div class="row">
+            <span>
+              <span class="label">Telemetry endpoint blocking</span>
+              <span class="description">Uses DNR and sendBeacon hook in two layers.</span>
+            </span>
+            <label class="switch">
+              <input id="telemetryBlocking" type="checkbox">
+              <span></span>
+            </label>
+          </div>
+          <div class="row">
+            <span>
+              <span class="label">Hide promotional elements</span>
+              <span class="description">Injects local conservative selectors; no remote lists.</span>
+            </span>
+            <label class="switch">
+              <input id="cosmeticFiltering" type="checkbox">
+              <span></span>
+            </label>
+          </div>
+          <div id="endpointList"></div>
+        </section>
+      </div>
+
+      <section class="card">
+        <h2>Diagnostics & measurement</h2>
+        <div class="row">
+          <span>
+            <span class="label">Store local playback measurements</span>
+            <span class="description">Records stalls, buffering time, first-play, nodes, rewrites, and fallbacks; never uploaded.</span>
+          </span>
+          <label class="switch">
+            <input id="diagnosticsEnabled" type="checkbox">
+            <span></span>
+          </label>
+        </div>
+        <div class="actions">
+          <button id="save" class="primary" type="button">Save settings</button>
+          <button id="clearProbe" type="button">Clear probe cache</button>
+          <a class="button" href="diagnostics.html" target="_blank">Open diagnostics panel</a>
+        </div>
+        <p id="status" class="status" role="status"></p>
+      </section>
+    </main>
+    <script type="module" src="options.js"></script>
+  </body>
+</html>
