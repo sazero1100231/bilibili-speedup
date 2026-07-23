@@ -1,0 +1,51 @@
+{
+  "list_version": "2026.07.16-1",
+  "last_reviewed": "2026-07-16",
+  "endpoints": [
+    {
+      "id": "data-log-web",
+      "dnr_id": 2001,
+      "domain": "data.bilibili.com",
+      "path_prefix": "/log/web",
+      "regex_filter": "^https?://data\\.bilibili\\.com/log/web(?:[/?#].*)?$",
+      "default_enabled": true,
+      "label": "data.bilibili.com /log/web",
+      "rationale": "封鎖網頁行為埋點上報。",
+      "side_effect": "不應影響播放、歷史或會員功能。"
+    },
+    {
+      "id": "data-v2-log",
+      "dnr_id": 2002,
+      "domain": "data.bilibili.com",
+      "path_prefix": "/v2/log/",
+      "regex_filter": "^https?://data\\.bilibili\\.com/v2/log(?:[/?#].*)?$",
+      "default_enabled": true,
+      "label": "data.bilibili.com /v2/log",
+      "rationale": "封鎖新版網頁行為埋點上報。",
+      "side_effect": "不應影響播放、歷史或會員功能。"
+    },
+    {
+      "id": "commercial-cm",
+      "dnr_id": 2003,
+      "domain": "cm.bilibili.com",
+      "path_prefix": "/",
+      "regex_filter": "^https?://cm\\.bilibili\\.com(?:[/?#].*)?$",
+      "default_enabled": true,
+      "label": "cm.bilibili.com",
+      "rationale": "封鎖商業化與廣告投放請求。",
+      "side_effect": "可能使部分活動或推廣模組留白。"
+    },
+    {
+      "id": "click-interface",
+      "dnr_id": 2004,
+      "domain": "api.bilibili.com",
+      "path_prefix": "/x/click-interface/",
+      "regex_filter": "^https?://api\\.bilibili\\.com/x/click-interface(?:[/?#].*)?$",
+      "default_enabled": false,
+      "label": "api.bilibili.com /x/click-interface",
+      "rationale": "選配封鎖觀看心跳與進度相關請求。",
+      "side_effect": "會影響跨裝置續播、觀看歷史或播放進度；預設關閉。",
+      "conservative": true
+    }
+  ]
+}

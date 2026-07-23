@@ -1,0 +1,20 @@
+{
+  "description": "可審計的 DNR 規則來源對照。為支援逐條開關與全域停用，執行時由 service worker 將本檔所述類別編譯為 dynamic rules；本檔不直接宣告為 manifest ruleset。",
+  "rule_classes": [
+    {
+      "id_range": "1001-1002",
+      "source": "rules/tracking-params.json",
+      "rationale": "對 bilibili.com 與選配 b23.tv 的 main_frame 導覽移除黑名單參數，並排除 passport.bilibili.com。"
+    },
+    {
+      "id_range": "2001-2099",
+      "source": "rules/blocked-endpoints.json",
+      "rationale": "依使用者逐條開關封鎖遙測與商業化端點。"
+    },
+    {
+      "id_range": "4000000-4999999",
+      "source": "runtime playurl route manifest",
+      "rationale": "只在目前分頁與播放場次中，將已降權的 m4s/flv/mp4 路由導向同 representation 的完整 signed backup URL。"
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "name": "bilibili-speedup",
+  "version": "1.1.17",
+  "private": true,
+  "type": "module",
+  "description": "Bilibili overseas playback accelerator and tracking cleaner (Manifest V3)",
+  "scripts": {
+    "build:release": "node scripts/build-release.js",
+    "test": "node test/run-unit.js && node test/validate-project.js",
+    "test:unit": "node test/run-unit.js",
+    "test:fault-routing": "node test/run-routing-faults.js",
+    "test:security-boundary": "node test/run-security-boundary.js",
+    "test:stream-concurrency": "node test/run-stream-concurrency.js",
+    "test:e2e": "node test/e2e/extension-smoke.js",
+    "test:e2e:release": "node scripts/build-release.js && node test/e2e/extension-smoke.js --release",
+    "test:e2e:stream-concurrency": "node test/e2e/stream-concurrency-smoke.js",
+    "test:e2e:stream-concurrency:release": "node scripts/build-release.js && node test/e2e/stream-concurrency-smoke.js --release",
+    "test:live-poc": "node test/e2e/live-bilibili-poc.js",
+    "test:live-soak": "node test/e2e/live-stream-soak.js",
+    "test:live-soak:release": "node scripts/build-release.js && node test/e2e/live-stream-soak.js --release",
+    "validate": "node test/validate-project.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Bili 海外加速 — 診斷</title>
+    <link rel="stylesheet" href="common.css">
+  </head>
+  <body>
+    <main>
+      <h1>診斷面板</h1>
+      <p class="lede">此頁只讀取本機 `chrome.storage.local`。匯出只會在你按下按鈕後產生本地 JSON 檔。</p>
+
+      <section class="card">
+        <h2>最近一場</h2>
+        <div id="metrics" class="metrics"></div>
+      </section>
+
+      <section class="card">
+        <h2>最近一場：Presentation／Route 明細</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Presentation</th>
+                <th>類型</th>
+                <th>Representation route</th>
+                <th>規劃 → 實際</th>
+                <th>切換</th>
+                <th>吞吐</th>
+                <th>Buffer</th>
+                <th>恢復</th>
+              </tr>
+            </thead>
+            <tbody id="routeRows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>最近一場：播放器明細</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>播放器</th>
+                <th>Presentation</th>
+                <th>Route</th>
+                <th>節點</th>
+                <th>Waiting／Stalled</th>
+                <th>Buffer</th>
+                <th>播放秒數</th>
+              </tr>
+            </thead>
+            <tbody id="playerRows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="row">
+          <span>
+            <span class="label">CDN 測速結果</span>
+            <span id="probeMeta" class="description"></span>
+          </span>
+          <button id="refresh" type="button">重新整理</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>規劃／實際節點</th>
+                <th>狀態</th>
+                <th>TTFB</th>
+                <th>吞吐</th>
+                <th>HTTP</th>
+              </tr>
+            </thead>
+            <tbody id="probeRows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>播放場次</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>時間</th>
+                <th>頁面</th>
+                <th>節點</th>
+                <th>卡頓</th>
+                <th>緩衝</th>
+                <th>起播</th>
+                <th>改寫／回退／降權</th>
+              </tr>
+            </thead>
+            <tbody id="sessionRows"></tbody>
+          </table>
+        </div>
+        <div class="actions">
+          <button id="export" class="primary" type="button">匯出 JSON</button>
+          <button id="clear" type="button">清除本地量測</button>
+        </div>
+        <p id="status" class="status" role="status"></p>
+      </section>
+    </main>
+    <script type="module" src="diagnostics.js"></script>
+  </body>
+</html>

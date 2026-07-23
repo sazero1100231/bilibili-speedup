@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Bili 海外加速</title>
+    <link rel="stylesheet" href="common.css">
+  </head>
+  <body class="popup">
+    <h1>Bili 海外加速</h1>
+    <p id="node" class="muted">讀取節點狀態…</p>
+
+    <section class="card">
+      <div class="row">
+        <span class="label">全域啟用</span>
+        <label class="switch">
+          <input id="globalEnabled" type="checkbox">
+          <span></span>
+        </label>
+      </div>
+      <div class="row">
+        <span class="label">播放加速</span>
+        <label class="switch">
+          <input id="accelerationEnabled" type="checkbox">
+          <span></span>
+        </label>
+      </div>
+      <div class="row">
+        <span class="label">URL 淨化</span>
+        <label class="switch">
+          <input id="urlCleaning" type="checkbox">
+          <span></span>
+        </label>
+      </div>
+      <div class="row">
+        <span class="label">遙測封鎖</span>
+        <label class="switch">
+          <input id="telemetryBlocking" type="checkbox">
+          <span></span>
+        </label>
+      </div>
+    </section>
+
+    <div class="actions">
+      <button id="options" type="button">詳細設定</button>
+      <a class="button" href="diagnostics.html" target="_blank">診斷</a>
+    </div>
+    <p id="status" class="status" role="status"></p>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

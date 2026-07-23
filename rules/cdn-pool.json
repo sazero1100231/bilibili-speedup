@@ -1,0 +1,64 @@
+{
+  "list_version": "2026.07.19-1",
+  "last_reviewed": "2026-07-19",
+  "preferred": [
+    {
+      "host": "upos-sz-upcdnbda2.bilivideo.com",
+      "rationale": "Bilibili BDA CDN 候選；連續實機日誌中是 Akamai 以外唯一反覆取得完整 256 KiB 且內容相容的節點，因此優先接受逐 representation 實測。"
+    },
+    {
+      "host": "upos-sz-mirrorcos.bilivideo.com",
+      "rationale": "社群長期使用的 COS 鏡像候選；仍須以當前媒體路徑實測排序。"
+    },
+    {
+      "host": "upos-sz-mirrorcosb.bilivideo.com",
+      "rationale": "COS 備援鏡像候選；避免單一鏡像漂移造成固定劣化。"
+    },
+    {
+      "host": "upos-sz-mirrorbos.bilivideo.com",
+      "rationale": "BOS 鏡像候選，交由 256 KiB Range 實測決定優先序。"
+    },
+    {
+      "host": "upos-sz-mirrorhw.bilivideo.com",
+      "rationale": "華為雲鏡像候選，僅在本地測速健康時使用。"
+    },
+    {
+      "host": "upos-sz-mirrorali.bilivideo.com",
+      "rationale": "阿里雲鏡像候選，節點品質可能隨地區與時間漂移。"
+    },
+    {
+      "host": "upos-sz-upcdnws.bilivideo.com",
+      "rationale": "Bilibili UP CDN 候選，以實測吞吐與 TTFB 排序。"
+    },
+    {
+      "host": "proxy-tf-all-ws.bilivideo.com",
+      "rationale": "代理型候選，只有實測成功時才進入健康列表，不作無測速預設首選。",
+      "requires_validation": true
+    }
+  ],
+  "conditional": [
+    {
+      "host": "upos-hz-mirrorakam.akamaized.net",
+      "rationale": "Akamai 海外 PoP 品質區域差異大，僅在實測健康時使用。",
+      "requires_validation": true
+    }
+  ],
+  "blocked": [
+    {
+      "pattern": "^upos-.*ov\\.bilivideo\\.com$",
+      "rationale": "海外 ov 鏡像常被調度到擁塞或限速 PoP。"
+    },
+    {
+      "pattern": ".*\\.mcdn\\.bilivideo\\.cn(:\\d+)?$",
+      "rationale": "MCDN/PCDN 節點品質不可控，包含 xy…xy 類型主機。"
+    },
+    {
+      "pattern": "^cn-.*-bcache-.*\\.bilivideo\\.com$",
+      "rationale": "PCDN bcache 節點常有高延遲、限速或可用性波動。"
+    },
+    {
+      "pattern": "^xy\\d+x.*xy\\..*$",
+      "rationale": "補充辨識 xy…xy 命名樣式；已由 MCDN DNR 規則涵蓋，供 playurl JSON 過濾。"
+    }
+  ]
+}

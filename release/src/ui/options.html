@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Bili 海外加速 — 設定</title>
+    <link rel="stylesheet" href="common.css">
+  </head>
+  <body>
+    <main>
+      <h1>Bili 海外加速</h1>
+      <p class="lede">所有設定與量測只保留在這台裝置。功能變更會立即更新規則，已開啟的頁面建議重載。</p>
+
+      <section class="card">
+        <div class="row">
+          <span>
+            <span class="label">全域啟用</span>
+            <span class="description">關閉後移除全部 DNR 動態／分頁規則與內容腳本註冊。</span>
+          </span>
+          <label class="switch">
+            <input id="globalEnabled" type="checkbox">
+            <span></span>
+          </label>
+        </div>
+      </section>
+
+      <div class="grid">
+        <section class="card">
+          <h2>播放加速</h2>
+          <div class="row">
+            <span>
+              <span class="label">啟用播放加速</span>
+              <span class="description">只處理普通視頻與番劇的媒體 URL，不解除地區限制。</span>
+            </span>
+            <label class="switch">
+              <input id="accelerationEnabled" type="checkbox">
+              <span></span>
+            </label>
+          </div>
+          <div class="row">
+            <span>
+              <span class="label">playurl JSON 改寫</span>
+              <span class="description">MAIN world 主路徑，重排 baseUrl 與 backupUrl。</span>
+            </span>
+            <label class="switch">
+              <input id="playurlRewrite" type="checkbox">
+              <span></span>
+            </label>
+          </div>
+          <div class="row">
+            <span>
+              <span class="label">DNR 網路層兜底</span>
+              <span class="description">以每分頁的完整簽名 URL 路由處理劣質 m4s/flv/mp4 節點。</span>
+            </span>
+            <label class="switch">
+              <input id="dnrFallback" type="checkbox">
+              <span></span>
+            </label>
+          </div>
+          <div class="row">
+            <label for="strategy">
+              <span class="label">節點策略</span>
+              <span class="description">自動模式以真實媒體路徑測速；手動模式固定首選。</span>
+            </label>
+            <select id="strategy">
+              <option value="auto">自動測速</option>
+              <option value="manual">手動指定</option>
+            </select>
+          </div>
+          <div class="row">
+            <label for="manualHost">
+              <span class="label">手動節點</span>
+              <span class="description">僅在「手動指定」時生效。</span>
+            </label>
+            <select id="manualHost"></select>
+          </div>
+          <div class="row">
+            <label for="probeCacheMinutes">
+              <span class="label">測速快取</span>
+              <span class="description">每個節點的結果快取 5–120 分鐘。</span>
+            </label>
+            <input id="probeCacheMinutes" type="number" min="5" max="120">
+          </div>
+        </section>
+
+        <section class="card">
+          <h2>追蹤淨化</h2>
+          <div class="row">
+            <span>
+              <span class="label">URL 參數淨化</span>
+              <span class="description">處理網址列、SPA、頁面連結與分享剪貼簿。</span>
+            </span>
+            <label class="switch">
+              <input id="urlCleaning" type="checkbox">
+              <span></span>
+            </label>
+          </div>
+          <div class="row">
+            <span>
+              <span class="label">遙測端點封鎖</span>
+              <span class="description">使用 DNR 與 sendBeacon hook 雙層處理。</span>
+            </span>
+            <label class="switch">
+              <input id="telemetryBlocking" type="checkbox">
+              <span></span>
+            </label>
+          </div>
+          <div class="row">
+            <span>
+              <span class="label">推廣元素隱藏</span>
+              <span class="description">注入本地保守選擇器，不使用遠端清單。</span>
+            </span>
+            <label class="switch">
+              <input id="cosmeticFiltering" type="checkbox">
+              <span></span>
+            </label>
+          </div>
+          <div id="endpointList"></div>
+        </section>
+      </div>
+
+      <section class="card">
+        <h2>診斷與量測</h2>
+        <div class="row">
+          <span>
+            <span class="label">儲存本地播放量測</span>
+            <span class="description">記錄卡頓、緩衝時間、起播、節點、改寫與回退；不會上傳。</span>
+          </span>
+          <label class="switch">
+            <input id="diagnosticsEnabled" type="checkbox">
+            <span></span>
+          </label>
+        </div>
+        <div class="actions">
+          <button id="save" class="primary" type="button">儲存設定</button>
+          <button id="clearProbe" type="button">清除測速快取</button>
+          <a class="button" href="diagnostics.html" target="_blank">開啟診斷面板</a>
+        </div>
+        <p id="status" class="status" role="status"></p>
+      </section>
+    </main>
+    <script type="module" src="options.js"></script>
+  </body>
+</html>
