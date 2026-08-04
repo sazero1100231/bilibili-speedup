@@ -1,0 +1,51 @@
+{
+  "list_version": "2026.07.16-1",
+  "last_reviewed": "2026-07-16",
+  "endpoints": [
+    {
+      "id": "data-log-web",
+      "dnr_id": 2001,
+      "domain": "data.bilibili.com",
+      "path_prefix": "/log/web",
+      "regex_filter": "^https?://data\\.bilibili\\.com/log/web(?:[/?#].*)?$",
+      "default_enabled": true,
+      "label": "data.bilibili.com /log/web",
+      "rationale": "Blocks web behavior tracking beacons.",
+      "side_effect": "Should not affect playback, history, or membership features."
+    },
+    {
+      "id": "data-v2-log",
+      "dnr_id": 2002,
+      "domain": "data.bilibili.com",
+      "path_prefix": "/v2/log/",
+      "regex_filter": "^https?://data\\.bilibili\\.com/v2/log(?:[/?#].*)?$",
+      "default_enabled": true,
+      "label": "data.bilibili.com /v2/log",
+      "rationale": "Blocks the new web behavior tracking beacons.",
+      "side_effect": "Should not affect playback, history, or membership features."
+    },
+    {
+      "id": "commercial-cm",
+      "dnr_id": 2003,
+      "domain": "cm.bilibili.com",
+      "path_prefix": "/",
+      "regex_filter": "^https?://cm\\.bilibili\\.com(?:[/?#].*)?$",
+      "default_enabled": true,
+      "label": "cm.bilibili.com",
+      "rationale": "Blocks commercial and ad-delivery requests.",
+      "side_effect": "May leave some campaign or promo modules blank."
+    },
+    {
+      "id": "click-interface",
+      "dnr_id": 2004,
+      "domain": "api.bilibili.com",
+      "path_prefix": "/x/click-interface/",
+      "regex_filter": "^https?://api\\.bilibili\\.com/x/click-interface(?:[/?#].*)?$",
+      "default_enabled": false,
+      "label": "api.bilibili.com /x/click-interface",
+      "rationale": "Optionally blocks watch-heartbeat and progress requests.",
+      "side_effect": "Affects cross-device resume, watch history, or playback progress; off by default.",
+      "conservative": true
+    }
+  ]
+}

@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Bili Overseas Speedup</title>
+    <link rel="stylesheet" href="common.css">
+  </head>
+  <body class="popup">
+    <h1>Bili Overseas Speedup</h1>
+    <p id="node" class="muted">Loading node status…</p>
+
+    <section class="card">
+      <div class="row">
+        <span class="label">Global enable</span>
+        <label class="switch">
+          <input id="globalEnabled" type="checkbox">
+          <span></span>
+        </label>
+      </div>
+      <div class="row">
+        <span class="label">Playback speedup</span>
+        <label class="switch">
+          <input id="accelerationEnabled" type="checkbox">
+          <span></span>
+        </label>
+      </div>
+      <div class="row">
+        <span class="label">URL cleaning</span>
+        <label class="switch">
+          <input id="urlCleaning" type="checkbox">
+          <span></span>
+        </label>
+      </div>
+      <div class="row">
+        <span class="label">Telemetry blocking</span>
+        <label class="switch">
+          <input id="telemetryBlocking" type="checkbox">
+          <span></span>
+        </label>
+      </div>
+    </section>
+
+    <div class="actions">
+      <button id="options" type="button">Advanced settings</button>
+      <a class="button" href="diagnostics.html" target="_blank">Diagnostics</a>
+    </div>
+    <p id="status" class="status" role="status"></p>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

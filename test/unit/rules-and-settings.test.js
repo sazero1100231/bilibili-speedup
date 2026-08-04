@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
   DEFAULT_SETTINGS,
+  PROBE_POLICY_VERSION,
   mainWorldModulesEnabled,
   normalizeRuntimeState,
   normalizeSettings,
@@ -29,6 +30,7 @@ test("settings are bounded and unknown fields are discarded", () => {
   assert.equal(settings.acceleration.probeCacheMinutes, 120);
   assert.equal(settings.acceleration.strategy, "auto");
   assert.equal(settings.diagnostics.maxSessions, 500);
+  assert.equal(settings.diagnostics.enabled, false);
   assert.equal("unknown" in settings, false);
   assert.equal("injected" in settings.acceleration, false);
 });
@@ -44,6 +46,7 @@ test("page and MAIN-world registration follow module switches", () => {
 
 test("runtime normalization preserves controlled dynamic maps", () => {
   const runtime = normalizeRuntimeState({
+    probePolicyVersion: PROBE_POLICY_VERSION,
     probeCache: {
       "upos.example": {
         host: "upos.example",
@@ -57,6 +60,29 @@ test("runtime normalization preserves controlled dynamic maps", () => {
   assert.equal(runtime.dnrMatchCounts[3001], 7);
 });
 
+test("runtime normalization invalidates probe evidence from an older policy", () => {
+  const runtime = normalizeRuntimeState({
+    probePolicyVersion: PROBE_POLICY_VERSION - 1,
+    selectedHost: "stale.bilivideo.com",
+    rankedHosts: ["stale.bilivideo.com"],
+    probeCache: {
+      "stale.bilivideo.com": {
+        host: "stale.bilivideo.com",
+        healthy: true,
+        throughputBps: 2_097_152_000,
+        measuredAt: 123
+      }
+    },
+    lastProbeAt: 123,
+    dnrMatchCounts: { 2001: 4 }
+  });
+  assert.equal(runtime.probePolicyVersion, PROBE_POLICY_VERSION);
+  assert.equal(runtime.selectedHost, "");
+  assert.deepEqual(runtime.rankedHosts, []);
+  assert.deepEqual(runtime.probeCache, {});
+  assert.equal(runtime.lastProbeAt, 0);
+  assert.equal(runtime.dnrMatchCounts[2001], 4);
+});
 test("every human-maintained rule entry contains a rationale", async () => {
   const [pool, tracking, endpoints, cosmetic, dnr] = await Promise.all([
     json("rules/cdn-pool.json"),

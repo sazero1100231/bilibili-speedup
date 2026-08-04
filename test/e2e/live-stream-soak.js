@@ -32,6 +32,8 @@ const browserCandidates = [
 ].filter(Boolean);
 const browserPath = browserCandidates.find(existsSync);
 const headful = process.env.E2E_HEADFUL === "1";
+const nativeMode = process.env.BILIBILI_SOAK_NATIVE === "1";
+const passiveMode = process.env.BILIBILI_SOAK_PASSIVE === "1";
 const durationSeconds = boundedNumber(
   process.env.BILIBILI_SOAK_SECONDS,
   1800,
@@ -541,39 +543,54 @@ try {
     }
   });
   client = new PipeCdpClient(browser);
-  const loaded = await client.send("Extensions.loadUnpacked", {
-    path: extensionRoot,
-    enableInIncognito: false
-  });
-  extensionId = loaded.id;
-  assert.match(extensionId, /^[a-p]{32}$/);
-
-  const controlTarget = await client.send("Target.createTarget", {
-    url: `chrome-extension://${extensionId}/src/ui/diagnostics.html`
-  });
-  const controlAttachment = await client.send("Target.attachToTarget", {
-    targetId: controlTarget.targetId,
-    flatten: true
-  });
-  control = new CdpSession(client, controlAttachment.sessionId);
-  await control.send("Runtime.enable");
-  await waitFor(
-    () =>
-      control.evaluate(
-        `typeof chrome.storage === "object" &&
-         typeof chrome.declarativeNetRequest === "object"`
-      ),
-    { label: "extension control APIs" }
-  );
-  await control.evaluate(`(() => {
-    globalThis.__biliSoakWrites = 0;
-    chrome.storage.onChanged.addListener((changes, area) => {
-      if (area === "local" && changes.diagnostics) {
-        globalThis.__biliSoakWrites += 1;
-      }
+  if (!nativeMode) {
+    const loaded = await client.send("Extensions.loadUnpacked", {
+      path: extensionRoot,
+      enableInIncognito: false
     });
-    return true;
-  })()`);
+    extensionId = loaded.id;
+    assert.match(extensionId, /^[a-p]{32}$/);
+
+    const controlTarget = await client.send("Target.createTarget", {
+      url: `chrome-extension://${extensionId}/src/ui/diagnostics.html`
+    });
+    const controlAttachment = await client.send("Target.attachToTarget", {
+      targetId: controlTarget.targetId,
+      flatten: true
+    });
+    control = new CdpSession(client, controlAttachment.sessionId);
+    await control.send("Runtime.enable");
+    await waitFor(
+      () =>
+        control.evaluate(
+          `typeof chrome.storage === "object" &&
+           typeof chrome.declarativeNetRequest === "object"`
+        ),
+      { label: "extension control APIs" }
+    );
+    await control.evaluate(`(() => {
+      globalThis.__biliSoakWrites = 0;
+      chrome.storage.onChanged.addListener((changes, area) => {
+        if (area === "local" && changes.diagnostics) {
+          globalThis.__biliSoakWrites += 1;
+        }
+      });
+      return true;
+    })()`);
+    await control.evaluate(`(async () => {
+      const response = await chrome.runtime.sendMessage({
+        type: "GET_RUNTIME_CONFIG"
+      });
+      if (!response?.ok || !response.config?.settings) {
+        throw new Error(response?.error ?? "runtime settings unavailable");
+      }
+      const settings = structuredClone(response.config.settings);
+      settings.diagnostics.enabled = true;
+      await chrome.storage.local.set({ settings });
+      return true;
+    })()`);
+    await sleep(100);
+  }
 
   const pageTarget = (await targetInfos(client)).find(
     (target) => target.type === "page" && target.url === "about:blank"
@@ -699,6 +716,8 @@ try {
     if (request) {
       request.status = response.status;
       request.responseHost = new URL(response.url).hostname;
+      request.fromDiskCache = Boolean(response.fromDiskCache);
+      request.fromServiceWorker = Boolean(response.fromServiceWorker);
       request.contentRange = String(
         response.headers?.["content-range"] ??
           response.headers?.["Content-Range"] ??
@@ -726,6 +745,14 @@ try {
     if (playerCoreRequest) {
       playerCoreRequest.status = response.status;
       playerCoreRequest.mimeType = String(response.mimeType ?? "");
+    }
+  });
+  page.on("Network.requestServedFromCache", ({ requestId }) => {
+    const request = [...mediaRequests]
+      .reverse()
+      .find((entry) => entry.requestId === requestId);
+    if (request) {
+      request.servedFromCache = true;
     }
   });
   page.on(
@@ -832,6 +859,16 @@ try {
   let queueIndex = 0;
 
   async function controlSnapshot() {
+    if (!control) {
+      return {
+        diagnosticsBytes: 0,
+        diagnosticSessions: 0,
+        diagnosticWrites: 0,
+        dynamicRules: 0,
+        sessionRules: 0,
+        latestResourceStats: null
+      };
+    }
     return control.evaluate(`(async () => {
       const { diagnostics } = await chrome.storage.local.get("diagnostics");
       const sessions = diagnostics?.sessions ?? [];
@@ -862,13 +899,45 @@ try {
         const video = videos
           .filter(candidate => !candidate.error)
           .sort((left, right) => score(right) - score(left))[0] ?? videos[0];
+        const playerRoot =
+          document.querySelector(".bpx-player-container") ??
+          document.querySelector(".bilibili-player") ??
+          document;
+        const loadingIndicators = [...playerRoot.querySelectorAll(
+          '.bpx-player-loading-panel, .bpx-player-loading, .bilibili-player-video-buffering, [class*="player"][class*="loading"], [class*="player"][class*="buffering"]'
+        )]
+          .filter(element => {
+            const style = getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return (
+              style.display !== "none" &&
+              style.visibility !== "hidden" &&
+              Number(style.opacity || 1) > 0 &&
+              rect.width > 0 &&
+              rect.height > 0
+            );
+          })
+          .slice(0, 8)
+          .map(element => ({
+            tag: element.tagName.toLowerCase(),
+            className: String(element.className ?? "").slice(0, 240)
+          }));
         let bufferAhead = 0;
+        let activeBufferStart = null;
+        let activeBufferEnd = null;
+        const bufferedRanges = [];
         if (video) {
           for (let index = 0; index < video.buffered.length; index += 1) {
+            bufferedRanges.push({
+              start: video.buffered.start(index),
+              end: video.buffered.end(index)
+            });
             if (
               video.buffered.start(index) <= video.currentTime &&
               video.currentTime <= video.buffered.end(index)
             ) {
+              activeBufferStart = video.buffered.start(index);
+              activeBufferEnd = video.buffered.end(index);
               bufferAhead = Math.max(
                 bufferAhead,
                 video.buffered.end(index) - video.currentTime
@@ -896,13 +965,20 @@ try {
                 currentTime: video.currentTime,
                 duration: Number.isFinite(video.duration) ? video.duration : null,
                 bufferAhead,
+                activeBufferStart,
+                activeBufferEnd,
+                bufferedRanges,
                 paused: video.paused,
                 seeking: video.seeking,
+                ended: video.ended,
+                playbackRate: video.playbackRate,
+                defaultPlaybackRate: video.defaultPlaybackRate,
                 readyState: video.readyState,
                 networkState: video.networkState,
                 errorCode: video.error?.code ?? 0
               }
-            : null
+            : null,
+          loadingIndicators
         };
       })()`)
       .catch(() => null);
@@ -1187,7 +1263,11 @@ try {
     );
     while (videoFound && Date.now() < visitDeadline) {
       const elapsed = Date.now() - (visit.readyAt ?? visitStartedAt);
-      if (!visit.seekAttempted && elapsed >= (dwellSeconds * 1000) / 3) {
+      if (
+        !passiveMode &&
+        !visit.seekAttempted &&
+        elapsed >= (dwellSeconds * 1000) / 3
+      ) {
         visit.seekAttempted = true;
         const seek = await page
           .evaluate(`(async () => {
@@ -1292,6 +1372,7 @@ try {
       const elapsedAfterSeek =
         Date.now() - (visit.readyAt ?? visitStartedAt);
       if (
+        !passiveMode &&
         !visit.qualityAttempted &&
         elapsedAfterSeek >= (dwellSeconds * 2000) / 3
       ) {
@@ -1520,38 +1601,47 @@ try {
   })()`).catch((error) => ({
     error: String(error instanceof Error ? error.message : error).slice(0, 200)
   }));
-  finalDiagnostics = await control.evaluate(`(async () => {
-    const { diagnostics } = await chrome.storage.local.get("diagnostics");
-    return diagnostics ?? { sessions: [] };
-  })()`);
-  const beforeClose = await control.evaluate(`(async () => ({
-    sessionRules: (await chrome.declarativeNetRequest.getSessionRules()).length,
-    diagnosticWrites: globalThis.__biliSoakWrites ?? 0
-  }))()`);
-  await client.send("Target.closeTarget", { targetId: pageTargetId });
-  const cleanupStartedAt = Date.now();
-  cleanupEvidence = await waitFor(
-    async () => {
-      const state = await control.evaluate(`(async () => ({
-        sessionRules: (await chrome.declarativeNetRequest.getSessionRules()).length,
-        diagnosticWrites: globalThis.__biliSoakWrites ?? 0
-      }))()`);
-      return state.sessionRules === 0 ? state : null;
-    },
-    { timeoutMs: 1000, intervalMs: 50, label: "tab-close session-rule cleanup" }
-  )
-    .then((state) => ({
+  if (control) {
+    finalDiagnostics = await control.evaluate(`(async () => {
+      const { diagnostics } = await chrome.storage.local.get("diagnostics");
+      return diagnostics ?? { sessions: [] };
+    })()`);
+    const beforeClose = await control.evaluate(`(async () => ({
+      sessionRules: (await chrome.declarativeNetRequest.getSessionRules()).length,
+      diagnosticWrites: globalThis.__biliSoakWrites ?? 0
+    }))()`);
+    await client.send("Target.closeTarget", { targetId: pageTargetId });
+    const cleanupStartedAt = Date.now();
+    cleanupEvidence = await waitFor(
+      async () => {
+        const state = await control.evaluate(`(async () => ({
+          sessionRules: (await chrome.declarativeNetRequest.getSessionRules()).length,
+          diagnosticWrites: globalThis.__biliSoakWrites ?? 0
+        }))()`);
+        return state.sessionRules === 0 ? state : null;
+      },
+      { timeoutMs: 1000, intervalMs: 50, label: "tab-close session-rule cleanup" }
+    )
+      .then((state) => ({
+        passed: true,
+        latencyMs: Date.now() - cleanupStartedAt,
+        beforeClose,
+        afterClose: state
+      }))
+      .catch((error) => ({
+        passed: false,
+        latencyMs: Date.now() - cleanupStartedAt,
+        beforeClose,
+        error: error instanceof Error ? error.message : String(error)
+      }));
+  } else {
+    await client.send("Target.closeTarget", { targetId: pageTargetId });
+    cleanupEvidence = {
       passed: true,
-      latencyMs: Date.now() - cleanupStartedAt,
-      beforeClose,
-      afterClose: state
-    }))
-    .catch((error) => ({
-      passed: false,
-      latencyMs: Date.now() - cleanupStartedAt,
-      beforeClose,
-      error: error instanceof Error ? error.message : String(error)
-    }));
+      notApplicable: true,
+      reason: "native mode does not install extension session rules"
+    };
+  }
 } catch (error) {
   runError = error instanceof Error ? error.stack ?? error.message : String(error);
 } finally {
@@ -1725,9 +1815,12 @@ try {
         : "provided_dedicated_browser_profile",
       authenticated: authenticatedObserved,
       realBilibiliNetwork: true,
-      extensionBuild: process.argv.includes("--release")
-        ? "release"
-        : "development",
+      extensionBuild: nativeMode
+        ? "native"
+        : process.argv.includes("--release")
+          ? "release"
+          : "development",
+      passivePlayback: passiveMode,
       requestedDurationSeconds: durationSeconds,
       actualDurationMs: endedAt - startedAt,
       requestedMaxVideos: maxVideos,
@@ -1750,7 +1843,7 @@ try {
     environment: {
       browser: path.basename(browserPath),
       extensionId,
-      extensionRoot,
+      extensionRoot: nativeMode ? null : extensionRoot,
       stderrTail: stderr.join("").slice(-10000),
       pageErrors
     },

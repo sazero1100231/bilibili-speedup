@@ -4,6 +4,8 @@ export const STORAGE_KEYS = Object.freeze({
   diagnostics: "diagnostics"
 });
 
+export const PROBE_POLICY_VERSION = 2;
+
 export const DEFAULT_SETTINGS = Object.freeze({
   schemaVersion: 1,
   globalEnabled: true,
@@ -27,12 +29,13 @@ export const DEFAULT_SETTINGS = Object.freeze({
     }
   },
   diagnostics: {
-    enabled: true,
+    enabled: false,
     maxSessions: 500
   }
 });
 
 export const DEFAULT_RUNTIME_STATE = Object.freeze({
+  probePolicyVersion: PROBE_POLICY_VERSION,
   selectedHost: "",
   rankedHosts: [],
   probeCache: {},
@@ -90,8 +93,19 @@ export function normalizeSettings(input, endpointCatalog = []) {
 
 export function normalizeRuntimeState(input) {
   const runtime = deepMerge(DEFAULT_RUNTIME_STATE, input);
-  if (isPlainObject(input?.probeCache)) {
+  const currentProbePolicy =
+    Number(input?.probePolicyVersion) === PROBE_POLICY_VERSION;
+  runtime.probePolicyVersion = PROBE_POLICY_VERSION;
+  if (currentProbePolicy && isPlainObject(input?.probeCache)) {
     runtime.probeCache = structuredClone(input.probeCache);
+  } else if (!currentProbePolicy) {
+    // Probe timing policy is authorization evidence, not durable user data.
+    // Clear pre-versioned results so an upgrade cannot retain an inflated
+    // throughput estimate produced by an older measurement policy.
+    runtime.selectedHost = "";
+    runtime.rankedHosts = [];
+    runtime.probeCache = {};
+    runtime.lastProbeAt = 0;
   }
   if (isPlainObject(input?.dnrMatchCounts)) {
     runtime.dnrMatchCounts = structuredClone(input.dnrMatchCounts);

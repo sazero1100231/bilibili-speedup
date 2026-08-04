@@ -9,6 +9,7 @@ import {
 
 export const PROBE_BYTES = 262144;
 export const PROBE_TIMEOUT_MS = 3000;
+export const MIN_RELIABLE_PROBE_TRANSFER_MS = 5;
 
 function normalizedProbeTiming(value, fallback) {
   if (!value || typeof value !== "object") {
@@ -103,7 +104,10 @@ async function probeUrl({
       ttfbMs: 0,
       transferDurationMs: 0,
       durationMs: 0,
+      throughputDurationMs: 0,
       throughputBps: 0,
+      requestThroughputBps: 0,
+      bodyTimingReliable: false,
       measuredAt: Date.now(),
       error: "probe target outside the allowed media surface"
     };
@@ -144,14 +148,20 @@ async function probeUrl({
       response.probeTiming,
       fallbackTiming
     );
-    // Representation bitrate is a payload-rate requirement. Use the
-    // page-side body interval so CDN latency and extension IPC remain
-    // separately observable. A zero-resolution body interval falls back to
-    // the conservative total page-fetch duration instead of becoming 1 ms.
-    const throughputDurationMs =
-      timing.transferDurationMs > 0
-        ? timing.transferDurationMs
-        : timing.durationMs;
+    // A tiny page-side body interval cannot distinguish real network transfer
+    // from a response that was already buffered before JavaScript resumed.
+    // Treat sub-5 ms samples as scheduling-limited and use the conservative
+    // full request duration. The floor also prevents timer quantization from
+    // becoming multi-gigabit routing evidence.
+    const bodyTimingReliable =
+      timing.transferDurationMs >= MIN_RELIABLE_PROBE_TRANSFER_MS;
+    const throughputDurationMs = bodyTimingReliable
+      ? timing.transferDurationMs
+      : Math.max(MIN_RELIABLE_PROBE_TRANSFER_MS, timing.durationMs);
+    const requestDurationMs = Math.max(
+      MIN_RELIABLE_PROBE_TRANSFER_MS,
+      timing.durationMs
+    );
     const finalUrl = response.url || targetUrl;
     let finalTargetMatches = false;
     try {
@@ -185,9 +195,14 @@ async function probeUrl({
       ttfbMs: timing.ttfbMs,
       transferDurationMs: timing.transferDurationMs,
       durationMs: timing.durationMs,
+      throughputDurationMs,
       throughputBps: Math.round(
         (sample.byteLength * 8 * 1000) / throughputDurationMs
       ),
+      requestThroughputBps: Math.round(
+        (sample.byteLength * 8 * 1000) / requestDurationMs
+      ),
+      bodyTimingReliable,
       measuredAt: Date.now()
     };
   } catch (error) {
@@ -202,7 +217,10 @@ async function probeUrl({
       ttfbMs: timeoutMs,
       transferDurationMs: 0,
       durationMs: timeoutMs,
+      throughputDurationMs: timeoutMs,
       throughputBps: 0,
+      requestThroughputBps: 0,
+      bodyTimingReliable: false,
       measuredAt: Date.now(),
       error: error instanceof Error ? error.message.slice(0, 160) : String(error)
     };
@@ -327,7 +345,10 @@ export async function probeMediaPath({
         ttfbMs: 0,
         transferDurationMs: 0,
         durationMs: 0,
+        throughputDurationMs: 0,
         throughputBps: 0,
+        requestThroughputBps: 0,
+        bodyTimingReliable: false,
         measuredAt: now
       }
     : await probeUrl({

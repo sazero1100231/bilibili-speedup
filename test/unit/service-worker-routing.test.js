@@ -12,13 +12,18 @@ const sessionRules = [];
 const sessionRuleUpdateLog = [];
 const sessionRuleCountHistory = [];
 const tabMessageLog = [];
-let registeredScripts = [];
+const tabDiagnosticSnapshots = new Map();
+let registeredScripts = [
+  { id: "outdated-main", js: ["src/content/main-world.js"] },
+  { id: "outdated-bridge", js: ["src/content/bridge.js"] }
+];
 let registerScriptCalls = 0;
 let unregisterScriptCalls = 0;
 let messageListener;
 let storageChangedListener;
 let tabRemovedListener;
 let failNextSessionRuleUpdate = false;
+let nextDiagnosticStorageBarrier = null;
 
 function replaceArray(target, values) {
   target.splice(0, target.length, ...values);
@@ -62,7 +67,13 @@ globalThis.chrome = {
         return selectedStorage(keys);
       },
       async set(values) {
-        storageSetLog.push(Object.keys(values));
+        const keys = Object.keys(values);
+        storageSetLog.push(keys);
+        if (keys.includes("diagnostics") && nextDiagnosticStorageBarrier) {
+          const barrier = nextDiagnosticStorageBarrier;
+          nextDiagnosticStorageBarrier = null;
+          await barrier;
+        }
         Object.assign(storageState, structuredClone(values));
       }
     },
@@ -140,6 +151,24 @@ globalThis.chrome = {
         message: structuredClone(message),
         options: structuredClone(options)
       });
+      if (message.type === "CAPTURE_DIAGNOSTIC_SNAPSHOT") {
+        const session = tabDiagnosticSnapshots.get(tabId);
+        if (!session) {
+          return {
+            ok: false,
+            type: "DIAGNOSTIC_SNAPSHOT",
+            version: 1,
+            sessionId: message.sessionId
+          };
+        }
+        return {
+          ok: true,
+          type: "DIAGNOSTIC_SNAPSHOT",
+          version: 1,
+          sessionId: message.sessionId,
+          session: structuredClone(session)
+        };
+      }
       if (message.type === "CANCEL_PAGE_PROBE_FETCH") {
         return {
           ok: true,
@@ -244,6 +273,11 @@ await waitFor(
   () => storageState.settings && registeredScripts.length === 2,
   "service-worker initialization"
 );
+assert.deepEqual(
+  registeredScripts.map((script) => script.id).sort(),
+  ["bilibili-speedup-bridge", "bilibili-speedup-main"]
+);
+assert.equal(unregisterScriptCalls, 1);
 globalThis.fetch = originalFetch;
 
 function sendWithSender(message, sender) {
@@ -272,6 +306,23 @@ function send(message, tabId) {
     documentId: `document-${tabId}`
   });
 }
+
+async function withDiagnosticCollection(operation) {
+  const previous = storageState.settings.diagnostics.enabled;
+  storageState.settings.diagnostics.enabled = true;
+  try {
+    return await operation();
+  } finally {
+    storageState.settings.diagnostics.enabled = previous;
+  }
+}
+
+const diagnosticPageSender = Object.freeze({
+  id: "test-extension",
+  url: chrome.runtime.getURL("src/ui/diagnostics.html"),
+  tab: { id: 9_900 },
+  frameId: 0
+});
 
 function sendWithBoundTab(message, tabId) {
   return sendWithSender(
@@ -1163,6 +1214,218 @@ test("a byte-compatible candidate below the representation throughput requiremen
   }
 });
 
+test("a one-millisecond body interval cannot become multi-gigabit route evidence", async () => {
+  const tabId = 409;
+  const sessionId = "session-quantized-body-timing";
+  const presentationId = "bvid-BVQUANTIZED1";
+  const routeKey = "/path/quantized-body.m4s";
+  const referenceUrl =
+    "https://upos-hz-mirrorakam.akamaized.net/path/quantized-body.m4s?hdnts=official";
+  const sample = new Uint8Array(262_144).fill(29);
+  const referenceHash = createHash("sha256").update(sample).digest("hex");
+  await send(
+    {
+      type: "START_PLAYBACK_SESSION",
+      sessionId,
+      sessionEpoch: 1,
+      pageUrl: "https://www.bilibili.com/video/BVQUANTIZED1"
+    },
+    tabId
+  );
+  await send(
+    {
+      type: "REGISTER_MEDIA_ROUTES",
+      sessionId,
+      routes: [
+        {
+          presentationId,
+          routeKey,
+          urls: [referenceUrl],
+          kind: "video",
+          bandwidth: 8_000_000
+        }
+      ]
+    },
+    tabId
+  );
+
+  globalThis.fetch = async (url) => {
+    const host = new URL(url).hostname;
+    if (host === "upos-sz-upcdnbda2.bilivideo.com") {
+      const response = new Response(sample, { status: 206 });
+      Object.defineProperty(response, "probeTiming", {
+        value: {
+          ttfbMs: 309,
+          transferDurationMs: 1,
+          durationMs: 310
+        }
+      });
+      return response;
+    }
+    return new Response("signature rejected", { status: 403 });
+  };
+  try {
+    const response = await send(
+      {
+        type: "PROBE_MEDIA",
+        sessionId,
+        presentationId,
+        routeKey,
+        mediaUrl: referenceUrl,
+        observedReference: true,
+        referenceHash,
+        referenceStatus: 206,
+        referenceBytes: 262_144
+      },
+      tabId
+    );
+    const candidate = response.config.probeResults.find(
+      (entry) => entry.host === "upos-sz-upcdnbda2.bilivideo.com"
+    );
+    assert.equal(candidate.compatible, true);
+    assert.equal(candidate.routeQualified, false);
+    assert.equal(candidate.healthy, false);
+    assert.equal(candidate.bodyTimingReliable, false);
+    assert.equal(candidate.throughputDurationMs, 310);
+    assert.equal(candidate.throughputBps, 6_765_006);
+    assert.equal(candidate.requestThroughputBps, 6_765_006);
+    assert.equal(candidate.requiredBps, 10_000_000);
+    assert.equal(candidate.presentationId, presentationId);
+    assert.equal(candidate.routeKey, routeKey);
+    assert.equal(candidate.kind, "video");
+    assert.equal(candidate.source, "pool");
+    assert.deepEqual(
+      response.config.compatibleRoutes[`${presentationId}::${routeKey}`],
+      []
+    );
+    assert.equal(response.probeOutcome.compatiblePoolCandidates, 1);
+    assert.equal(response.probeOutcome.underpoweredPoolCandidates, 1);
+    assert.equal(response.config.selectedHost, "");
+  } finally {
+    globalThis.fetch = originalFetch;
+    await send({ type: "CLEAR_PROBE_CACHE" }, tabId);
+    tabRemovedListener(tabId);
+  }
+});
+test("runtime diagnostics retain same-host evidence for separate media routes", async () => {
+  const tabId = 411;
+  const sessionId = "session-multi-route-probes";
+  const presentationId = "bvid-BVMULTIROUTE:cid-1";
+  const videoRouteKey = "/path/multi-video.m4s";
+  const audioRouteKey = "/path/multi-audio.m4s";
+  const videoUrl =
+    "https://upos-hz-mirrorakam.akamaized.net/path/multi-video.m4s?hdnts=video";
+  const audioUrl =
+    "https://upos-hz-mirrorakam.akamaized.net/path/multi-audio.m4s?hdnts=audio";
+  const videoSample = new Uint8Array(262_144).fill(31);
+  const audioSample = new Uint8Array(262_144).fill(37);
+  const videoHash = createHash("sha256")
+    .update(videoSample)
+    .digest("hex");
+  const audioHash = createHash("sha256")
+    .update(audioSample)
+    .digest("hex");
+  await send(
+    {
+      type: "START_PLAYBACK_SESSION",
+      sessionId,
+      sessionEpoch: 1,
+      pageUrl: "https://www.bilibili.com/video/BVMULTIROUTE"
+    },
+    tabId
+  );
+  await send(
+    {
+      type: "REGISTER_MEDIA_ROUTES",
+      sessionId,
+      routes: [
+        {
+          presentationId,
+          routeKey: videoRouteKey,
+          urls: [videoUrl],
+          kind: "video",
+          bandwidth: 1_000_000
+        },
+        {
+          presentationId,
+          routeKey: audioRouteKey,
+          urls: [audioUrl],
+          kind: "audio",
+          bandwidth: 128_000
+        }
+      ]
+    },
+    tabId
+  );
+
+  globalThis.fetch = async (url) => {
+    const parsed = new URL(url);
+    if (parsed.hostname === "upos-sz-upcdnbda2.bilivideo.com") {
+      const sample = parsed.pathname === videoRouteKey
+        ? videoSample
+        : audioSample;
+      const response = new Response(sample, { status: 206 });
+      Object.defineProperty(response, "probeTiming", {
+        value: {
+          ttfbMs: 10,
+          transferDurationMs: 50,
+          durationMs: 60
+        }
+      });
+      return response;
+    }
+    return new Response("signature rejected", { status: 403 });
+  };
+  try {
+    await send(
+      {
+        type: "PROBE_MEDIA",
+        sessionId,
+        presentationId,
+        routeKey: videoRouteKey,
+        mediaUrl: videoUrl,
+        observedReference: true,
+        referenceHash: videoHash,
+        referenceStatus: 206,
+        referenceBytes: 262_144
+      },
+      tabId
+    );
+    const response = await send(
+      {
+        type: "PROBE_MEDIA",
+        sessionId,
+        presentationId,
+        routeKey: audioRouteKey,
+        mediaUrl: audioUrl,
+        observedReference: true,
+        referenceHash: audioHash,
+        referenceStatus: 206,
+        referenceBytes: 262_144
+      },
+      tabId
+    );
+    const retained = response.config.probeResults.filter(
+      (entry) =>
+        entry.host === "upos-sz-upcdnbda2.bilivideo.com" &&
+        entry.presentationId === presentationId
+    );
+    assert.equal(retained.length, 2);
+    assert.deepEqual(
+      retained.map((entry) => entry.routeKey).sort(),
+      [audioRouteKey, videoRouteKey]
+    );
+    assert.deepEqual(
+      retained.map((entry) => entry.kind).sort(),
+      ["audio", "video"]
+    );
+    assert.ok(retained.every((entry) => entry.bodyTimingReliable));
+  } finally {
+    globalThis.fetch = originalFetch;
+    await send({ type: "CLEAR_PROBE_CACHE" }, tabId);
+    tabRemovedListener(tabId);
+  }
+});
 test("page payload timing excludes extension message delay from route capacity", async () => {
   const tabId = 309;
   const sessionId = "session-page-probe-timing";
@@ -1246,6 +1509,91 @@ test("page payload timing excludes extension message delay from route capacity",
       "upos-sz-upcdnbda2.bilivideo.com"
     );
     assert.equal(response.probeOutcome.underpoweredPoolCandidates, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await send({ type: "CLEAR_PROBE_CACHE" }, tabId);
+    tabRemovedListener(tabId);
+  }
+});
+
+test("fast body throughput cannot qualify a route with playback-hostile TTFB", async () => {
+  const tabId = 509;
+  const sessionId = "session-high-ttfb-candidate";
+  const presentationId = "bvid-BVHIGHTTFB1";
+  const routeKey = "/path/high-ttfb.m4s";
+  const referenceUrl =
+    "https://upos-hz-mirrorakam.akamaized.net/path/high-ttfb.m4s?hdnts=official";
+  const sample = new Uint8Array(262_144).fill(31);
+  const referenceHash = createHash("sha256").update(sample).digest("hex");
+  await send(
+    {
+      type: "START_PLAYBACK_SESSION",
+      sessionId,
+      sessionEpoch: 1,
+      pageUrl: "https://www.bilibili.com/video/BVHIGHTTFB1"
+    },
+    tabId
+  );
+  await send(
+    {
+      type: "REGISTER_MEDIA_ROUTES",
+      sessionId,
+      routes: [
+        {
+          presentationId,
+          routeKey,
+          urls: [referenceUrl],
+          kind: "video",
+          bandwidth: 3_181_028
+        }
+      ]
+    },
+    tabId
+  );
+
+  globalThis.fetch = async (url) => {
+    const host = new URL(url).hostname;
+    if (host === "upos-sz-upcdnbda2.bilivideo.com") {
+      const response = new Response(sample, { status: 206 });
+      Object.defineProperty(response, "probeTiming", {
+        value: {
+          ttfbMs: 1_531,
+          transferDurationMs: 15,
+          durationMs: 1_546
+        }
+      });
+      return response;
+    }
+    return new Response("signature rejected", { status: 403 });
+  };
+  try {
+    const response = await send(
+      {
+        type: "PROBE_MEDIA",
+        sessionId,
+        presentationId,
+        routeKey,
+        mediaUrl: referenceUrl,
+        observedReference: true,
+        referenceHash,
+        referenceStatus: 206,
+        referenceBytes: 262_144
+      },
+      tabId
+    );
+    const candidate = response.config.probeResults.find(
+      (entry) => entry.host === "upos-sz-upcdnbda2.bilivideo.com"
+    );
+    assert.equal(candidate.compatible, true);
+    assert.ok(candidate.throughputBps > candidate.requiredBps);
+    assert.equal(candidate.ttfbMs, 1_531);
+    assert.equal(candidate.routeQualified, false);
+    assert.equal(candidate.healthy, false);
+    assert.deepEqual(
+      response.config.compatibleRoutes[`${presentationId}::${routeKey}`],
+      []
+    );
+    assert.equal(response.probeOutcome.underpoweredPoolCandidates, 1);
   } finally {
     globalThis.fetch = originalFetch;
     await send({ type: "CLEAR_PROBE_CACHE" }, tabId);
@@ -2308,6 +2656,63 @@ test("playback-risk evidence expires instead of accumulating forever", async () 
   tabRemovedListener(tabId);
 });
 
+test("buffered playback stalls never accumulate CDN risk", async () => {
+  const tabId = 308;
+  const sessionId = "session-buffered-stall";
+  const presentationId = "BV-buffered-stall:cid-1";
+  const routeKey = "/path/buffered-stall.m4s";
+  await send(
+    {
+      type: "START_PLAYBACK_SESSION",
+      sessionId,
+      sessionEpoch: 1,
+      pageUrl: "https://www.bilibili.com/video/BV-buffered-stall"
+    },
+    tabId
+  );
+  await send(
+    {
+      type: "REGISTER_MEDIA_ROUTES",
+      sessionId,
+      routes: [
+        {
+          presentationId,
+          routeKey,
+          urls: [
+            "https://upos-sz-mirrorcos.bilivideo.com/path/buffered-stall.m4s",
+            "https://upos-hz-mirrorakam.akamaized.net/path/buffered-stall.m4s"
+          ],
+          kind: "video"
+        }
+      ]
+    },
+    tabId
+  );
+  const risk = {
+    type: "PLAYBACK_RISK",
+    sessionId,
+    presentationId,
+    routeKey,
+    host: "upos-sz-mirrorcos.bilivideo.com",
+    reason: "seeking-waiting"
+  };
+  const buffered = await send(
+    { ...risk, bufferAhead: 20, readyState: 4 },
+    tabId
+  );
+  assert.equal(buffered.count, 0);
+  assert.equal(buffered.escalated, false);
+  assert.equal(buffered.ignored, "buffered-playback-stall");
+
+  const firstNetworkRisk = await send(
+    { ...risk, bufferAhead: 0, readyState: 1 },
+    tabId
+  );
+  assert.equal(firstNetworkRisk.count, 1);
+  assert.equal(firstNetworkRisk.escalated, false);
+  tabRemovedListener(tabId);
+});
+
 test("a hard failure on the only route host reports immediate exhaustion", async () => {
   const tabId = 307;
   const sessionId = "session-route-exhausted";
@@ -2673,6 +3078,89 @@ test("inactive playback state is evicted after two minutes without waiting for c
   }
 });
 
+test("playback heartbeat preserves route quarantine beyond the inactivity TTL", async () => {
+  const originalDateNow = Date.now;
+  const startedAt = originalDateNow();
+  const playbackTabId = 610;
+  const wakeTabId = 611;
+  const sessionId = "session-heartbeat";
+  const presentationId = "heartbeat-presentation";
+  const safeUrl =
+    "https://upos-sz-upcdnbda2.bilivideo.com/path/video.m4s?token=safe";
+  try {
+    await send(
+      {
+        type: "START_PLAYBACK_SESSION",
+        sessionId,
+        sessionEpoch: 1,
+        pageUrl: "https://www.bilibili.com/video/BV-heartbeat"
+      },
+      playbackTabId
+    );
+    await send(
+      {
+        type: "REGISTER_MEDIA_ROUTES",
+        sessionId,
+        routes: [
+          {
+            presentationId,
+            routeKey: "/path/video.m4s",
+            urls: [backupUrl, safeUrl]
+          }
+        ]
+      },
+      playbackTabId
+    );
+    await send(
+      {
+        type: "HOST_DEGRADED",
+        sessionId,
+        presentationId,
+        routeKey: "/path/video.m4s",
+        host: "upos-hz-mirrorakam.akamaized.net",
+        reason: "timeout"
+      },
+      playbackTabId
+    );
+
+    Date.now = () => startedAt + 90_000;
+    await send(
+      { type: "KEEP_PLAYBACK_SESSION", sessionId },
+      playbackTabId
+    );
+
+    Date.now = () => startedAt + 180_000;
+    await send(
+      {
+        type: "START_PLAYBACK_SESSION",
+        sessionId: "session-heartbeat-wakeup",
+        sessionEpoch: 1,
+        pageUrl: "https://www.bilibili.com/video/BV-heartbeat-wakeup"
+      },
+      wakeTabId
+    );
+    const response = await send(
+      {
+        type: "GET_RUNTIME_CONFIG",
+        sessionId,
+        sessionEpoch: 1,
+        pageUrl: "https://www.bilibili.com/video/BV-heartbeat"
+      },
+      playbackTabId
+    );
+    assert.deepEqual(
+      response.config.degradedRoutes[
+        presentationId + "::/path/video.m4s"
+      ],
+      ["upos-hz-mirrorakam.akamaized.net"]
+    );
+  } finally {
+    Date.now = originalDateNow;
+    tabRemovedListener(playbackTabId);
+    tabRemovedListener(wakeTabId);
+  }
+});
+
 test("concurrent session starts cannot exceed the 32-tab tracking cap", async () => {
   tabRemovedListener(101);
   const tabIds = Array.from({ length: 32 }, (_, index) => 700 + index);
@@ -2754,122 +3242,461 @@ test("presentation, route, and host state remain within hard caps under oversize
   tabRemovedListener(tabId);
 });
 
-test("diagnostics coalesce per-tab events and enforce the serialized byte budget", async () => {
-  const writesBefore = storageSetLog.filter((keys) =>
-    keys.includes("diagnostics")
-  ).length;
-  const detail = "x".repeat(300);
-  await Promise.all(
-    Array.from({ length: 420 }, (_, index) =>
-      send(
-        {
-          type: "RECORD_DIAGNOSTIC",
-          session: {
-            id: `diagnostic-${index}`,
-            pageUrl:
-              `https://www.bilibili.com/video/BV${index}?` +
-              "q=".repeat(250),
-            startedAt: index + 1,
-            updatedAt: index + 1,
-            ...(index === 419
-              ? {
-                  routeDetails: Object.fromEntries([
-                    ...Array.from({ length: 40 }, (_, route) => [
-                      `planning-${route}`,
-                      {
-                        id: `planning-${route}`,
-                        presentationId: "presentation",
-                        routeKey: `/planning/${route}.m4s`,
-                        updatedAt: route + 1
-                      }
-                    ]),
-                    [
-                      "degraded-route",
-                      {
-                        id: "degraded-route",
-                        presentationId: "presentation",
-                        routeKey: "/active/degraded.m4s",
-                        bandwidth: 8_000_000,
-                        lastRequiredBps: 10_000_000,
-                        mediaHost:
-                          "upos-sz-mirrorcos.bilivideo.com",
-                        degradedCount: 12,
-                        recoveryStatus: "handoff",
-                        updatedAt: 100
-                      }
-                    ]
-                  ]),
-                  playerDetails: Object.fromEntries(
-                    Array.from({ length: 6 }, (_, player) => [
-                      `player-${player + 1}`,
-                      {
-                        playerId: `player-${player + 1}`,
-                        updatedAt: player + 1,
-                        paused: player % 2 === 0
-                      }
-                    ])
-                  )
-                }
-              : {}),
-            recentEvents: Array.from({ length: 30 }, () => ({
-              type: "beacon-blocked",
-              at: index + 1,
-              detail
-            }))
-          }
-        },
-        777
-      )
-    )
-  );
-  const writesAfter = storageSetLog.filter((keys) =>
-    keys.includes("diagnostics")
-  ).length;
-  assert.equal(writesAfter - writesBefore, 1);
-  assert.ok(
-    new TextEncoder().encode(JSON.stringify(storageState.diagnostics))
-      .byteLength <=
-      1024 * 1024
-  );
-  assert.ok(storageState.diagnostics.sessions.length < 420);
-  const newest = storageState.diagnostics.sessions.find(
-    (session) => session.id === "diagnostic-419"
-  );
-  assert.deepEqual(
-    Object.keys(newest.playerDetails),
-    ["player-6", "player-5", "player-4", "player-3"]
-  );
-  assert.equal(newest.playerDetails["player-5"].paused, true);
-  assert.ok(Object.keys(newest.routeDetails).length <= 9);
-  assert.equal(
-    newest.routeDetails["degraded-route"].recoveryStatus,
-    "handoff"
-  );
-  assert.equal(newest.routeDetails["degraded-route"].bandwidth, 8_000_000);
-  assert.equal(
-    newest.routeDetails["degraded-route"].lastRequiredBps,
-    10_000_000
-  );
-  const throttledWritesBefore = storageSetLog.filter((keys) =>
-    keys.includes("diagnostics")
-  ).length;
-  await send(
+test("the background rejects diagnostic writes while collection is disabled", async () => {
+  assert.equal(storageState.settings.diagnostics.enabled, false);
+  const response = await send(
     {
       type: "RECORD_DIAGNOSTIC",
       session: {
-        id: "diagnostic-throttled",
-        pageUrl: "https://www.bilibili.com/video/BV-throttled",
+        id: "diagnostic-disabled",
+        pageUrl: "https://www.bilibili.com/video/BVDISABLED?private=1",
         startedAt: Date.now(),
         updatedAt: Date.now()
       }
     },
-    778
+    776
   );
+  assert.equal(response.recorded, false);
   assert.equal(
-    storageSetLog.filter((keys) => keys.includes("diagnostics")).length,
-    throttledWritesBefore,
-    "steady-state diagnostics must be coalesced instead of rewriting storage every second"
+    (storageState.diagnostics?.sessions ?? []).some(
+      (session) => session.id === "diagnostic-disabled"
+    ),
+    false
   );
+});
+
+test("diagnostics coalesce per-tab events and enforce the serialized byte budget", async () => {
+  await withDiagnosticCollection(async () => {
+    const writesBefore = storageSetLog.filter((keys) =>
+      keys.includes("diagnostics")
+    ).length;
+    const detail = "x".repeat(300);
+    await Promise.all(
+      Array.from({ length: 420 }, (_, index) =>
+        send(
+          {
+            type: "RECORD_DIAGNOSTIC",
+            session: {
+              id: `diagnostic-${index}`,
+              pageUrl:
+                `https://www.bilibili.com/video/BV${index}?` +
+                "q=".repeat(250),
+              startedAt: index + 1,
+              updatedAt: index + 1,
+              ...(index === 419
+                ? {
+                    routeDetails: Object.fromEntries([
+                      ...Array.from({ length: 40 }, (_, route) => [
+                        `planning-${route}`,
+                        {
+                          id: `planning-${route}`,
+                          presentationId: "presentation",
+                          routeKey: `/planning/${route}.m4s`,
+                          updatedAt: route + 1
+                        }
+                      ]),
+                      [
+                        "degraded-route",
+                        {
+                          id: "degraded-route",
+                          presentationId: "presentation",
+                          routeKey: "/active/degraded.m4s",
+                          bandwidth: 8_000_000,
+                          lastRequiredBps: 10_000_000,
+                          mediaHost:
+                            "upos-sz-mirrorcos.bilivideo.com",
+                          degradedCount: 12,
+                          recoveryStatus: "handoff",
+                          updatedAt: 100
+                        }
+                      ]
+                    ]),
+                    playerDetails: Object.fromEntries(
+                      Array.from({ length: 6 }, (_, player) => [
+                        `player-${player + 1}`,
+                        {
+                          playerId: `player-${player + 1}`,
+                          updatedAt: player + 1,
+                          paused: player % 2 === 0
+                        }
+                      ])
+                    )
+                  }
+                : {}),
+              recentEvents: Array.from({ length: 30 }, () => ({
+                type: "beacon-blocked",
+                at: index + 1,
+                detail
+              }))
+            }
+          },
+          777
+        )
+      )
+    );
+    const writesAfter = storageSetLog.filter((keys) =>
+      keys.includes("diagnostics")
+    ).length;
+    assert.equal(writesAfter - writesBefore, 1);
+    assert.ok(
+      new TextEncoder().encode(JSON.stringify(storageState.diagnostics))
+        .byteLength <=
+        1024 * 1024
+    );
+    assert.ok(storageState.diagnostics.sessions.length < 420);
+    const newest = storageState.diagnostics.sessions.find(
+      (session) => session.id === "diagnostic-419"
+    );
+    assert.equal(
+      newest.pageUrl,
+      "https://www.bilibili.com/video/BV419"
+    );
+    assert.deepEqual(
+      Object.keys(newest.playerDetails),
+      ["player-6", "player-5", "player-4", "player-3"]
+    );
+    assert.equal(newest.playerDetails["player-5"].paused, true);
+    assert.ok(Object.keys(newest.routeDetails).length <= 9);
+    assert.equal(
+      newest.routeDetails["degraded-route"].recoveryStatus,
+      "handoff"
+    );
+    assert.equal(newest.routeDetails["degraded-route"].bandwidth, 8_000_000);
+    assert.equal(
+      newest.routeDetails["degraded-route"].lastRequiredBps,
+      10_000_000
+    );
+    const throttledWritesBefore = storageSetLog.filter((keys) =>
+      keys.includes("diagnostics")
+    ).length;
+    await send(
+      {
+        type: "RECORD_DIAGNOSTIC",
+        session: {
+          id: "diagnostic-throttled",
+          pageUrl: "https://www.bilibili.com/video/BV-throttled",
+          startedAt: Date.now(),
+          updatedAt: Date.now()
+        }
+      },
+      778
+    );
+    assert.equal(
+      storageSetLog.filter((keys) => keys.includes("diagnostics")).length,
+      throttledWritesBefore,
+      "steady-state diagnostics must be coalesced instead of rewriting storage every second"
+    );
+  });
+});
+
+test("an older pending diagnostic snapshot cannot overwrite a newer one", async () => {
+  await withDiagnosticCollection(async () => {
+    const tabId = 779;
+    const sessionId = "diagnostic-monotonic";
+    const now = Date.now();
+    const newerWrite = send(
+      {
+        type: "RECORD_DIAGNOSTIC",
+        session: {
+          id: sessionId,
+          pageUrl:
+            "https://www.bilibili.com/video/BVMONOTONIC?token=private#part",
+          startedAt: now - 10_000,
+          updatedAt: now,
+          waitingCount: 7
+        }
+      },
+      tabId
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    const olderWrite = send(
+      {
+        type: "RECORD_DIAGNOSTIC",
+        session: {
+          id: sessionId,
+          pageUrl: "https://www.bilibili.com/video/BVMONOTONIC?older=1",
+          startedAt: now - 10_000,
+          updatedAt: now - 5_000,
+          waitingCount: 1
+        }
+      },
+      tabId
+    );
+    await Promise.all([newerWrite, olderWrite]);
+
+    const prepared = await sendWithSender(
+      { type: "PREPARE_DIAGNOSTIC_EXPORT" },
+      diagnosticPageSender
+    );
+    const retained = prepared.sessions.find(
+      (session) => session.id === sessionId
+    );
+    assert.equal(retained.updatedAt, now);
+    assert.equal(retained.waitingCount, 7);
+    assert.equal(
+      retained.pageUrl,
+      "https://www.bilibili.com/video/BVMONOTONIC"
+    );
+  });
+});
+
+test("clearing diagnostics waits for an in-flight storage write before erasing data", async () => {
+  await withDiagnosticCollection(async () => {
+    let released = false;
+    let releaseBarrier = () => {};
+    nextDiagnosticStorageBarrier = new Promise((resolve) => {
+      releaseBarrier = () => {
+        if (!released) {
+          released = true;
+          resolve();
+        }
+      };
+    });
+    try {
+      const writesBefore = storageSetLog.filter((keys) =>
+        keys.includes("diagnostics")
+      ).length;
+      const now = Date.now();
+      const recordPromise = send(
+        {
+          type: "RECORD_DIAGNOSTIC",
+          session: {
+            id: "diagnostic-clear-race",
+            pageUrl: "https://www.bilibili.com/video/BVCLEARRACE",
+            startedAt: now,
+            updatedAt: now,
+            waitingCount: 3
+          }
+        },
+        780
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+      const preparePromise = sendWithSender(
+        { type: "PREPARE_DIAGNOSTIC_EXPORT" },
+        diagnosticPageSender
+      );
+      await waitFor(
+        () =>
+          storageSetLog.filter((keys) => keys.includes("diagnostics"))
+            .length > writesBefore,
+        "blocked diagnostic storage write"
+      );
+
+      let clearSettled = false;
+      const clearPromise = sendWithSender(
+        { type: "CLEAR_DIAGNOSTICS" },
+        diagnosticPageSender
+      ).then((response) => {
+        clearSettled = true;
+        return response;
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      assert.equal(clearSettled, false);
+
+      releaseBarrier();
+      const [recorded, _prepared, cleared] = await Promise.all([
+        recordPromise,
+        preparePromise,
+        clearPromise
+      ]);
+      assert.equal(recorded.recorded, true);
+      assert.equal(cleared.cleared, true);
+      assert.deepEqual(storageState.diagnostics.sessions, []);
+    } finally {
+      releaseBarrier();
+      nextDiagnosticStorageBarrier = null;
+    }
+  });
+});
+
+test("diagnostic settings reach active tabs and export force-captures their latest session", async () => {
+  const tabId = 410;
+  const sessionId = "session-diagnostic-export";
+  const originalSettings = structuredClone(storageState.settings);
+  const originalConsoleError = console.error;
+  const reconciliationErrors = [];
+  await send(
+    {
+      type: "START_PLAYBACK_SESSION",
+      sessionId,
+      sessionEpoch: 1,
+      pageUrl: "https://www.bilibili.com/video/BVDIAGNOSTIC"
+    },
+    tabId
+  );
+  const presentationId = "bvid-BVDIAGNOSTIC:cid-1";
+  const routeKey = "/path/video.m4s";
+  await send(
+    {
+      type: "REGISTER_MEDIA_ROUTES",
+      sessionId,
+      routes: [
+        {
+          presentationId,
+          routeKey,
+          urls: [sourceUrl, backupUrl],
+          kind: "video",
+          bandwidth: 1_000_000
+        }
+      ]
+    },
+    tabId
+  );
+  await send(
+    {
+      type: "HOST_DEGRADED",
+      sessionId,
+      presentationId,
+      routeKey,
+      host: "upos-sz-mirrorcosov.bilivideo.com",
+      reason: "diagnostic-settings-test"
+    },
+    tabId
+  );
+
+  try {
+    const enabledSettings = structuredClone(originalSettings);
+    enabledSettings.diagnostics.enabled = true;
+    const enabledMessageBaseline = tabMessageLog.length;
+    storageState.settings = structuredClone(enabledSettings);
+    console.error = (...args) => reconciliationErrors.push(args);
+    failNextSessionRuleUpdate = true;
+    storageChangedListener(
+      {
+        settings: {
+          oldValue: originalSettings,
+          newValue: structuredClone(enabledSettings)
+        }
+      },
+      "local"
+    );
+    await waitFor(
+      () =>
+        tabMessageLog.slice(enabledMessageBaseline).find(
+          (entry) =>
+            entry.tabId === tabId &&
+            entry.message.type === "ROUTING_CONFIG_UPDATED" &&
+            entry.message.reason === "settings-changed" &&
+            entry.message.config.settings.diagnostics.enabled === true
+        ),
+      "diagnostic setting push to active tab"
+    );
+    await waitFor(
+      () => reconciliationErrors.length > 0,
+      "synthetic rule refresh failure reporting"
+    );
+    console.error = originalConsoleError;
+
+    const updatedAt = Date.now();
+    tabDiagnosticSnapshots.set(tabId, {
+      id: sessionId,
+      pageUrl:
+        "https://www.bilibili.com/video/BVDIAGNOSTIC?account=private#fragment",
+      startedAt: updatedAt - 5_000,
+      updatedAt,
+      waitingCount: 2,
+      stalledCount: 1,
+      bufferingMs: 900
+    });
+    const prepared = await sendWithSender(
+      { type: "PREPARE_DIAGNOSTIC_EXPORT" },
+      diagnosticPageSender
+    );
+    assert.equal(prepared.capture.collectionEnabled, true);
+    assert.ok(prepared.capture.activePlaybackSessions >= 1);
+    assert.ok(prepared.capture.capturedActiveSessions >= 1);
+    const captured = prepared.sessions.find(
+      (session) => session.id === sessionId
+    );
+    assert.equal(captured.updatedAt, updatedAt);
+    assert.equal(captured.waitingCount, 2);
+    assert.equal(captured.stalledCount, 1);
+    assert.equal(
+      captured.pageUrl,
+      "https://www.bilibili.com/video/BVDIAGNOSTIC"
+    );
+    assert.ok(
+      tabMessageLog.some(
+        (entry) =>
+          entry.tabId === tabId &&
+          entry.message.type === "CAPTURE_DIAGNOSTIC_SNAPSHOT" &&
+          entry.message.sessionId === sessionId &&
+          (entry.options.documentId === `document-${tabId}` ||
+            entry.options.frameId === 0)
+      )
+    );
+
+    tabDiagnosticSnapshots.set(tabId, {
+      ...tabDiagnosticSnapshots.get(tabId),
+      id: "different-session-id",
+      updatedAt: updatedAt + 1_000
+    });
+    const mismatched = await sendWithSender(
+      { type: "PREPARE_DIAGNOSTIC_EXPORT" },
+      diagnosticPageSender
+    );
+    assert.equal(mismatched.capture.failureReasons["session-mismatch"], 1);
+    assert.equal(
+      mismatched.sessions.some(
+        (session) => session.id === "different-session-id"
+      ),
+      false
+    );
+    assert.equal(
+      mismatched.sessions.find((session) => session.id === sessionId).updatedAt,
+      updatedAt
+    );
+    await assert.rejects(
+      () =>
+        sendWithSender(
+          { type: "PREPARE_DIAGNOSTIC_EXPORT" },
+          {
+            tab: { id: tabId },
+            frameId: 0,
+            documentId: `document-${tabId}`,
+            url: "https://www.bilibili.com/video/BVDIAGNOSTIC"
+          }
+        ),
+      /restricted to the diagnostics page/i
+    );
+  } finally {
+    console.error = originalConsoleError;
+    failNextSessionRuleUpdate = false;
+    tabDiagnosticSnapshots.delete(tabId);
+    const restoreBaseline = tabMessageLog.length;
+    const restoreRuleBaseline = sessionRuleUpdateLog.length;
+    const previous = structuredClone(storageState.settings);
+    storageState.settings = structuredClone(originalSettings);
+    storageChangedListener(
+      {
+        settings: {
+          oldValue: previous,
+          newValue: structuredClone(originalSettings)
+        }
+      },
+      "local"
+    );
+    await waitFor(
+      () =>
+        tabMessageLog.slice(restoreBaseline).find(
+          (entry) =>
+            entry.tabId === tabId &&
+            entry.message.type === "ROUTING_CONFIG_UPDATED" &&
+            entry.message.reason === "settings-changed" &&
+            entry.message.config.settings.diagnostics.enabled ===
+              originalSettings.diagnostics.enabled
+        ),
+      "diagnostic setting restoration"
+    );
+    await waitFor(
+      () => sessionRuleUpdateLog.length > restoreRuleBaseline,
+      "diagnostic setting rule restoration"
+    );
+    tabRemovedListener(tabId);
+  }
 });
 
 test("stale sessions are rejected and global disable removes every rule surface", async () => {

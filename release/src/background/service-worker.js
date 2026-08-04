@@ -38,7 +38,14 @@ import {
   uniqueStrings
 } from "../lib/url-utils.js";
 
-const CONTENT_SCRIPT_IDS = ["bili-oversea-main", "bili-oversea-bridge"];
+const CONTENT_SCRIPT_IDS = Object.freeze([
+  "bilibili-speedup-main",
+  "bilibili-speedup-bridge"
+]);
+const CONTENT_SCRIPT_FILES = new Set([
+  "src/content/main-world.js",
+  "src/content/bridge.js"
+]);
 const OWN_RULE_MIN = 1000;
 const OWN_RULE_MAX = 3999;
 const OWN_SESSION_RULE_MIN = 4_000_000;
@@ -48,13 +55,16 @@ const MAX_PRESENTATIONS_PER_TAB = 4;
 const MAX_ROUTES_PER_PRESENTATION = 32;
 const MAX_HOSTS_PER_ROUTE = 8;
 const MAX_PROBE_CANDIDATES_PER_ROUTE = 2;
+const MAX_RUNTIME_PROBE_RESULTS = 64;
 const MAX_PROBE_CANDIDATES_PER_SWEEP = 8;
 const ROUTE_THROUGHPUT_HEADROOM = 1.25;
+const MAX_ROUTE_PROBE_TTFB_MS = 1_000;
 const INACTIVE_SESSION_TTL_MS = 120_000;
 const MAX_RETIRED_DOCUMENTS_PER_TAB = 32;
 const RETIRED_DOCUMENT_TTL_MS = 10 * 60_000;
 const MAX_NATIVE_ROUTE_BYPASS_MS = 60_000;
 const PLAYBACK_RISK_WINDOW_MS = 15_000;
+const NETWORK_RISK_MAX_BUFFER_AHEAD_SECONDS = 4;
 const ruleDataPromise = loadRuleData();
 let reconcileChain = Promise.resolve();
 let runtimeMutationChain = Promise.resolve();
@@ -727,16 +737,22 @@ async function removeOrphanedSessionRules() {
 }
 
 async function reconcileContentScripts(settings) {
-  const existing = await chrome.scripting.getRegisteredContentScripts({
-    ids: CONTENT_SCRIPT_IDS
-  });
+  const registered = await chrome.scripting.getRegisteredContentScripts();
+  const existing = registered.filter(
+    (entry) =>
+      CONTENT_SCRIPT_IDS.includes(entry.id) ||
+      (
+        Array.isArray(entry.js) &&
+        entry.js.some((file) => CONTENT_SCRIPT_FILES.has(file))
+      )
+  );
   const pageEnabled = pageModulesEnabled(settings);
   const desiredIds = pageEnabled
     ? [
         ...(mainWorldModulesEnabled(settings)
-          ? ["bili-oversea-main"]
+          ? [CONTENT_SCRIPT_IDS[0]]
           : []),
-        "bili-oversea-bridge"
+        CONTENT_SCRIPT_IDS[1]
       ].sort()
     : [];
   const existingIds = existing.map((entry) => entry.id).sort();
@@ -764,15 +780,15 @@ async function reconcileContentScripts(settings) {
   const registrations = [
     {
       ...shared,
-      id: "bili-oversea-bridge",
+      id: CONTENT_SCRIPT_IDS[1],
       js: ["src/content/bridge.js"],
       world: "ISOLATED"
     }
   ];
-  if (desiredIds.includes("bili-oversea-main")) {
+  if (desiredIds.includes(CONTENT_SCRIPT_IDS[0])) {
     registrations.unshift({
       ...shared,
-      id: "bili-oversea-main",
+      id: CONTENT_SCRIPT_IDS[0],
       js: ["src/content/main-world.js"],
       world: "MAIN"
     });
@@ -850,6 +866,18 @@ function routeRequiredThroughput(route) {
   );
 }
 
+function routeProbeHasCapacity(result, requiredBps = 0) {
+  const throughputQualified =
+    !requiredBps || Number(result?.throughputBps) >= requiredBps;
+  const ttfbMs = Number(result?.ttfbMs);
+  // Body-only throughput catches CDN capacity without extension message
+  // overhead, but a long wait before every Range is still fatal to streaming.
+  // Missing TTFB is accepted only for legacy in-memory metrics.
+  const latencyQualified =
+    !Number.isFinite(ttfbMs) || ttfbMs <= MAX_ROUTE_PROBE_TTFB_MS;
+  return throughputQualified && latencyQualified;
+}
+
 function pruneUnderpoweredRouteCandidates(session, route) {
   const requiredBps = routeRequiredThroughput(route);
   if (!requiredBps) {
@@ -859,7 +887,7 @@ function pruneUnderpoweredRouteCandidates(session, route) {
   const metrics = session.compatibleRouteThroughputs.get(stateKey);
   const compatible = session.compatibleRoutes.get(stateKey) ?? [];
   const retained = compatible.filter(
-    (url) => Number(metrics?.get(url)?.throughputBps) >= requiredBps
+    (url) => routeProbeHasCapacity(metrics?.get(url), requiredBps)
   );
   if (retained.length) {
     session.compatibleRoutes.set(stateKey, retained);
@@ -1312,12 +1340,21 @@ async function registerMediaRoutes(message, sender) {
   };
 }
 
-function runtimeProbeEntry(result, requiredBps = 0, routeAllowed = true) {
+function runtimeProbeEntry(
+  result,
+  requiredBps = 0,
+  routeAllowed = true,
+  route = null
+) {
   const routeQualified =
     routeAllowed &&
-    (!requiredBps || Number(result.throughputBps) >= requiredBps);
+    routeProbeHasCapacity(result, requiredBps);
   return {
     host: result.host,
+    presentationId: String(route?.presentationId ?? "").slice(0, 300),
+    routeKey: String(route?.routeKey ?? "").slice(0, 1000),
+    kind: String(route?.kind ?? "media").slice(0, 20),
+    source: String(result.source ?? "").slice(0, 30),
     healthy: Boolean(
       result.eligible !== false &&
         result.healthy &&
@@ -1332,10 +1369,33 @@ function runtimeProbeEntry(result, requiredBps = 0, routeAllowed = true) {
     ttfbMs: Number(result.ttfbMs) || 0,
     transferDurationMs: Number(result.transferDurationMs) || 0,
     durationMs: Number(result.durationMs) || 0,
+    throughputDurationMs: Number(result.throughputDurationMs) || 0,
     throughputBps: Number(result.throughputBps) || 0,
+    requestThroughputBps: Number(result.requestThroughputBps) || 0,
+    bodyTimingReliable: Boolean(result.bodyTimingReliable),
     measuredAt: Number(result.measuredAt) || Date.now(),
     error: String(result.error ?? "").slice(0, 160)
   };
+}
+
+function mergeRuntimeProbeResults(current, entries) {
+  const merged = {
+    ...(current && typeof current === "object" ? current : {})
+  };
+  for (const entry of entries) {
+    const key =
+      `${entry.presentationId}\u0000${entry.routeKey}\u0000${entry.host}`;
+    merged[key] = entry;
+  }
+  return Object.fromEntries(
+    Object.entries(merged)
+      .sort(
+        (left, right) =>
+          (Number(right[1]?.measuredAt) || 0) -
+          (Number(left[1]?.measuredAt) || 0)
+      )
+      .slice(0, MAX_RUNTIME_PROBE_RESULTS)
+  );
 }
 
 function decodeProbeBodyBase64(value, declaredBytes) {
@@ -1694,8 +1754,7 @@ async function performProbe(
       !currentlyBlockedHosts.has(entry.host)
   );
   const underpoweredPoolResults = compatiblePoolResults.filter(
-    (entry) =>
-      requiredBps && Number(entry.throughputBps) < requiredBps
+    (entry) => !routeProbeHasCapacity(entry, requiredBps)
   );
   const underpoweredHosts = new Set(
     underpoweredPoolResults.map((entry) => entry.host)
@@ -1736,7 +1795,7 @@ async function performProbe(
       entry.healthy &&
       entry.compatible &&
       !currentlyBlockedHosts.has(entry.host) &&
-      (!requiredBps || Number(entry.throughputBps) >= requiredBps)
+      routeProbeHasCapacity(entry, requiredBps)
   );
   const qualifiedHosts = new Set(qualifiedResults.map((entry) => entry.host));
   const measuredHosts = new Set(
@@ -1760,6 +1819,7 @@ async function performProbe(
     }
     compatibleMetrics.set(entry.targetUrl, {
       throughputBps: Math.max(0, Number(entry.throughputBps) || 0),
+      ttfbMs: Math.max(0, Number(entry.ttfbMs) || 0),
       measuredAt: Math.max(0, Number(entry.measuredAt) || Date.now())
     });
   }
@@ -1779,9 +1839,10 @@ async function performProbe(
   const earlierCompatibleUrls = (tabSession.compatibleRoutes.get(stateKey) ?? [])
     .filter((url) => {
       const host = getHostname(url);
-      const stillQualified =
-        !requiredBps ||
-        Number(compatibleMetrics.get(url)?.throughputBps) >= requiredBps;
+      const stillQualified = routeProbeHasCapacity(
+        compatibleMetrics.get(url),
+        requiredBps
+      );
       return (
         !currentlyBlockedHosts.has(host) &&
         stillQualified &&
@@ -1815,19 +1876,17 @@ async function performProbe(
   }
   const nextRuntime = await mutateRuntimeState((current) => ({
     ...current,
-    probeCache: {
-      ...current.probeCache,
-      ...Object.fromEntries(
-        result.results.map((entry) => [
-          entry.host,
-          runtimeProbeEntry(
-            entry,
-            requiredBps,
-            !currentlyBlockedHosts.has(entry.host)
-          )
-        ])
+    probeCache: mergeRuntimeProbeResults(
+      current.probeCache,
+      result.results.map((entry) =>
+        runtimeProbeEntry(
+          entry,
+          requiredBps,
+          !currentlyBlockedHosts.has(entry.host),
+          registeredRoute
+        )
       )
-    },
+    ),
     rankedHosts: qualifiedResults
       .slice()
       .sort(
@@ -1908,6 +1967,10 @@ function queueProbe(
       tabId,
       estimatedBytes:
         PROBE_BYTES * (effectiveReferenceEvidence ? 2 : 3),
+      // Recovery has a small, separately bounded reserve. Without it,
+      // discovery for a previous SPA presentation can consume the whole
+      // per-tab minute before the active route stalls.
+      recovery,
       run: (signal) =>
         performProbe(
           mediaUrl,
@@ -2306,6 +2369,19 @@ async function recoverPlaybackHost(message, sender) {
 
 async function notePlaybackRisk(message, sender) {
   const { session } = requirePlaybackSession(message, sender);
+  const bufferAhead = Math.max(0, Number(message.bufferAhead) || 0);
+  const readyState = Math.max(0, Number(message.readyState) || 0);
+  if (
+    bufferAhead > NETWORK_RISK_MAX_BUFFER_AHEAD_SECONDS ||
+    readyState >= 3
+  ) {
+    return {
+      sessionId: session.sessionId,
+      escalated: false,
+      count: 0,
+      ignored: "buffered-playback-stall"
+    };
+  }
   const host = String(message.host ?? "").toLowerCase();
   const routeKey = String(message.routeKey ?? "").slice(0, 1000);
   const presentationId = sanitizePresentationId(message.presentationId);
@@ -2431,6 +2507,7 @@ function sanitizeRouteDetail(input, fallbackId = "") {
     ),
     lastObservedAt: Math.max(0, Number(input.lastObservedAt) || 0),
     recoveryStatus: String(input.recoveryStatus ?? "idle").slice(0, 20),
+    recoveryHost: String(input.recoveryHost ?? "").slice(0, 255),
     recoveryStartedAt: Math.max(0, Number(input.recoveryStartedAt) || 0),
     recoveryBaselineBuffer: Math.max(
       0,
@@ -2536,6 +2613,27 @@ function sanitizeDiagnosticRouteDetails(input) {
   );
 }
 
+function sanitizeDiagnosticPageUrl(input) {
+  try {
+    const parsed = new URL(String(input ?? ""));
+    if (
+      !["http:", "https:"].includes(parsed.protocol) ||
+      !["www.bilibili.com", "m.bilibili.com"].includes(
+        parsed.hostname.toLowerCase()
+      )
+    ) {
+      return "";
+    }
+    const pathname =
+      parsed.pathname === "/"
+        ? "/"
+        : parsed.pathname.replace(/\/+$/, "");
+    return `${parsed.protocol}//${parsed.hostname}${pathname}`.slice(0, 600);
+  } catch {
+    return "";
+  }
+}
+
 function sanitizeSession(input) {
   if (!input || typeof input !== "object") {
     throw new Error("Invalid diagnostic session");
@@ -2546,7 +2644,7 @@ function sanitizeSession(input) {
   }
   return {
     id,
-    pageUrl: String(input.pageUrl ?? "").slice(0, 600),
+    pageUrl: sanitizeDiagnosticPageUrl(input.pageUrl),
     startedAt: Number(input.startedAt) || Date.now(),
     updatedAt: Number(input.updatedAt) || Date.now(),
     firstPlayingMs:
@@ -2631,6 +2729,10 @@ function boundedDiagnosticSessions(maxSessions) {
 }
 
 function queueDiagnosticStorageWrite(force = false) {
+  if (force && deferredDiagnosticStorageTimer) {
+    clearTimeout(deferredDiagnosticStorageTimer);
+    deferredDiagnosticStorageTimer = null;
+  }
   diagnosticStorageChain = diagnosticStorageChain
     .catch(() => {})
     .then(async () => {
@@ -2706,7 +2808,10 @@ function flushDiagnosticTab(tabId) {
     try {
       await loadDiagnosticsCache();
       for (const session of pending.sessions.values()) {
-        diagnosticCache.set(session.id, session);
+        const current = diagnosticCache.get(session.id);
+        if (!current || session.updatedAt >= current.updatedAt) {
+          diagnosticCache.set(session.id, session);
+        }
       }
       const count = await queueDiagnosticStorageWrite();
       for (const waiter of pending.waiters) {
@@ -2736,13 +2841,16 @@ function recordDiagnostic(input, tabId = -1) {
     };
     pendingDiagnosticFlushes.set(tabId, pending);
   }
-  pending.sessions.set(session.id, session);
+  const currentPending = pending.sessions.get(session.id);
+  if (!currentPending || session.updatedAt >= currentPending.updatedAt) {
+    pending.sessions.set(session.id, session);
+  }
   return new Promise((resolve, reject) => {
     pending.waiters.push({ resolve, reject });
   });
 }
 
-function clearDiagnosticState() {
+async function clearDiagnosticState() {
   for (const pending of pendingDiagnosticFlushes.values()) {
     clearTimeout(pending.timer);
     for (const waiter of pending.waiters) {
@@ -2752,11 +2860,137 @@ function clearDiagnosticState() {
   pendingDiagnosticFlushes.clear();
   clearTimeout(deferredDiagnosticStorageTimer);
   deferredDiagnosticStorageTimer = null;
+  const activeMutations = [...diagnosticMutationChains.values()];
+  const activeStorageWrite = diagnosticStorageChain;
+  await Promise.all([
+    ...activeMutations.map((operation) => operation.catch(() => {})),
+    activeStorageWrite.catch(() => {})
+  ]);
+  clearTimeout(deferredDiagnosticStorageTimer);
+  deferredDiagnosticStorageTimer = null;
   lastDiagnosticStorageWriteAt = 0;
   lastDiagnosticStoredBytes = 0;
   diagnosticWriteTimestamps.length = 0;
   diagnosticCache.clear();
   diagnosticsCachePromise = Promise.resolve();
+}
+
+async function diagnosticCollectionEnabled() {
+  const stored = await chrome.storage.local.get(STORAGE_KEYS.settings);
+  const settings = normalizeSettings(stored[STORAGE_KEYS.settings]);
+  return Boolean(settings.globalEnabled && settings.diagnostics.enabled);
+}
+
+async function prepareDiagnosticExport() {
+  const initialState = await readState();
+  const collectionEnabled = Boolean(
+    initialState.settings.globalEnabled &&
+      initialState.settings.diagnostics.enabled
+  );
+  const activeSessions = [...tabPlaybackSessions];
+  let capturedActiveSessions = 0;
+  const failureReasons = {};
+  const noteFailure = (reason) => {
+    failureReasons[reason] = (failureReasons[reason] ?? 0) + 1;
+  };
+
+  await Promise.all(
+    [...pendingDiagnosticFlushes.keys()].map((tabId) =>
+      flushDiagnosticTab(tabId)
+    )
+  );
+
+  if (collectionEnabled) {
+    if (typeof chrome.tabs?.sendMessage !== "function") {
+      for (const _session of activeSessions) {
+        noteFailure("message-api-unavailable");
+      }
+    } else {
+      await Promise.all(
+        activeSessions.map(async ([tabId, session]) => {
+          const target = session.documentId
+            ? { documentId: session.documentId }
+            : { frameId: 0 };
+          let response;
+          try {
+            response = await chrome.tabs.sendMessage(
+              tabId,
+              {
+                type: "CAPTURE_DIAGNOSTIC_SNAPSHOT",
+                version: 1,
+                sessionId: session.sessionId
+              },
+              target
+            );
+          } catch {
+            noteFailure("message-failed");
+            return;
+          }
+          if (
+            !response?.ok ||
+            response.type !== "DIAGNOSTIC_SNAPSHOT" ||
+            response.version !== 1 ||
+            response.sessionId !== session.sessionId ||
+            !response.session
+          ) {
+            noteFailure("invalid-response");
+            return;
+          }
+          let sanitized;
+          try {
+            sanitized = sanitizeSession(response.session);
+          } catch {
+            noteFailure("invalid-session");
+            return;
+          }
+          if (sanitized.id !== session.sessionId) {
+            noteFailure("session-mismatch");
+            return;
+          }
+          await queueDiagnosticMutation(tabId, async () => {
+            await loadDiagnosticsCache();
+            const current = diagnosticCache.get(sanitized.id);
+            if (!current || sanitized.updatedAt >= current.updatedAt) {
+              diagnosticCache.set(sanitized.id, sanitized);
+            }
+          });
+          capturedActiveSessions += 1;
+        })
+      );
+    }
+  }
+
+  await Promise.all(
+    [...pendingDiagnosticFlushes.keys()].map((tabId) =>
+      flushDiagnosticTab(tabId)
+    )
+  );
+  await loadDiagnosticsCache();
+  await queueDiagnosticStorageWrite(true);
+  const state = await readState();
+  const sessions = Array.isArray(state.diagnostics?.sessions)
+    ? state.diagnostics.sessions
+    : [];
+  return {
+    version: chrome.runtime.getManifest().version,
+    settings: state.settings,
+    runtimeState: state.runtime,
+    sessions,
+    capture: {
+      collectionEnabled: Boolean(
+        state.settings.globalEnabled && state.settings.diagnostics.enabled
+      ),
+      activePlaybackSessions: activeSessions.length,
+      capturedActiveSessions,
+      failedActiveSessions: Object.values(failureReasons).reduce(
+        (sum, count) => sum + count,
+        0
+      ),
+      failureReasons,
+      preparedAt: Date.now()
+    },
+    config: await buildRuntimeConfig(state)
+  };
 }
 
 function applyCosmetic(enabled, sender) {
@@ -2792,6 +3026,15 @@ function applyCosmetic(enabled, sender) {
       cosmeticMutationChains.delete(key);
     }
   });
+}
+
+function requireDiagnosticExtensionPage(sender) {
+  if (
+    String(sender?.url ?? "") !==
+    chrome.runtime.getURL("src/ui/diagnostics.html")
+  ) {
+    throw new Error("Diagnostic export is restricted to the diagnostics page");
+  }
 }
 
 async function handleMessage(message, sender) {
@@ -2834,6 +3077,15 @@ async function handleMessage(message, sender) {
         sessionId: session.sessionId,
         routingTabId: tabId,
         config: await buildRuntimeConfig(state, tabId)
+      };
+    }
+    case "KEEP_PLAYBACK_SESSION": {
+      await requireRoutingEnabled();
+      const { tabId, sessionId } = requirePlaybackSession(message, sender);
+      return {
+        sessionId,
+        routingTabId: tabId,
+        resourceStats: routingResourceStats(tabId)
       };
     }
     case "STOP_PLAYBACK_SESSION": {
@@ -2919,7 +3171,13 @@ async function handleMessage(message, sender) {
     case "PLAYBACK_RISK":
       await requireRoutingEnabled();
       return notePlaybackRisk(message, sender);
+    case "PREPARE_DIAGNOSTIC_EXPORT":
+      requireDiagnosticExtensionPage(sender);
+      return prepareDiagnosticExport();
     case "RECORD_DIAGNOSTIC":
+      if (!(await diagnosticCollectionEnabled())) {
+        return { recorded: false };
+      }
       await recordDiagnostic(
         message.session,
         Number.isInteger(sender.tab?.id) ? sender.tab.id : -1
@@ -2929,7 +3187,8 @@ async function handleMessage(message, sender) {
       await applyCosmetic(Boolean(message.enabled), sender);
       return { applied: Boolean(message.enabled) };
     case "CLEAR_DIAGNOSTICS":
-      clearDiagnosticState();
+      requireDiagnosticExtensionPage(sender);
+      await clearDiagnosticState();
       await chrome.storage.local.set({
         [STORAGE_KEYS.diagnostics]: { sessions: [] }
       });
@@ -3026,7 +3285,14 @@ async function handleSettingsChanged(rawSettings, rawPreviousSettings) {
   } else {
     await Promise.all(
       [...tabPlaybackSessions].map(([tabId, session]) =>
-        replaceTabSessionRules(tabId, session)
+        Promise.all([
+          replaceTabSessionRules(tabId, session),
+          pushTabRoutingConfig(
+            tabId,
+            session,
+            "settings-changed"
+          ).catch(() => false)
+        ])
       )
     );
   }

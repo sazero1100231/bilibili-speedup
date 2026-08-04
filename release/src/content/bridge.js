@@ -11,7 +11,9 @@
   const MAX_ORDINARY_EVENTS = 32;
   const MAX_BEACON_AGGREGATES = 16;
   const HIDDEN_IDLE_SUSPEND_MS = 15_000;
+  const PLAYBACK_SESSION_HEARTBEAT_MS = 30_000;
   const PLAYBACK_RISK_CONFIRM_MS = 2_500;
+  const NETWORK_RISK_MAX_BUFFER_AHEAD_SECONDS = 4;
   const PAGE_PROBE_BYTES = 262_144;
   const PAGE_PROBE_TIMEOUT_MS = 3_000;
   const MAX_RECOVERY_SWEEP_PROBES = 4;
@@ -20,6 +22,7 @@
   const RECOVERY_BUDGET_BYPASS_MS = 60_000;
   const CRITICAL_EVENT_TYPES = new Set([
     "fallback",
+    "buffered-playback-stall",
     "handoff-triggered",
     "media-degraded",
     "playback-risk",
@@ -46,6 +49,7 @@
   let currentNavigationKey = playbackNavigationKey(location.href);
   let routingTabId = null;
   let sessionStartedPerformance = performance.now();
+  let lastPlaybackHeartbeatAt = sessionStartedPerformance;
   let sessionPlayerSerial = 0;
   let localCosmeticStyle = null;
   const observedVideos = new WeakSet();
@@ -211,7 +215,7 @@
         const detail = ensureRouteDetail(payload);
         if (detail) {
           detail.fallbackCount += 1;
-          detail.recoveryStatus = "handoff";
+          resetRouteRecovery(detail, "handoff");
           detail.recoveryStartedAt = Date.now();
           detail.recoveryBaselineBuffer = Math.max(
             0,
@@ -470,9 +474,11 @@
         latestSuccessfulRoutingGeneration: 0,
         lastObservedAt: 0,
         recoveryStatus: "idle",
+        recoveryHost: "",
         recoveryStartedAt: 0,
         recoveryBaselineBuffer: 0,
         recoveryHealthySegments: 0,
+        recoveryStrongTransfers: 0,
         rewritten: false,
         updatedAt: Date.now()
       };
@@ -514,10 +520,16 @@
     detail.requestResultsObserved ||= Boolean(observableResult);
     if (host && detail.mediaHost && detail.mediaHost !== host) {
       detail.routeSwitchCount += 1;
-      if (detail.requestResultsObserved) {
-        beginRouteRecovery(detail);
+      if (
+        detail.requestResultsObserved &&
+        routeHostIsHalfOpen(detail, host)
+      ) {
+        beginRouteRecovery(detail, host);
       } else {
-        detail.recoveryStatus = "diagnostic-only";
+        resetRouteRecovery(
+          detail,
+          detail.requestResultsObserved ? "idle" : "diagnostic-only"
+        );
       }
       addEvent("route-switch", host, routeEventDetail(payload));
     }
@@ -588,14 +600,42 @@
     }
   }
 
-  function beginRouteRecovery(detail) {
-    const id = detail.id;
-    clearTimeout(recoveryTimers.get(id));
-    detail.recoveryStatus = "pending";
-    detail.recoveryStartedAt = Date.now();
-    detail.recoveryBaselineBuffer = detail.lastBufferAhead;
+  function halfOpenHostsForRoute(detail) {
+    const routes = config?.halfOpenRoutes;
+    if (!routes || typeof routes !== "object") {
+      return [];
+    }
+    return [routes[detail.id], routes[detail.routeKey]]
+      .filter(Array.isArray)
+      .flat();
+  }
+
+  function routeHostIsHalfOpen(detail, host) {
+    const normalizedHost = String(host ?? "").toLowerCase();
+    return Boolean(
+      normalizedHost &&
+      halfOpenHostsForRoute(detail).some(
+        (candidate) => String(candidate).toLowerCase() === normalizedHost
+      )
+    );
+  }
+
+  function resetRouteRecovery(detail, status = "idle") {
+    clearTimeout(recoveryTimers.get(detail.id));
+    recoveryTimers.delete(detail.id);
+    detail.recoveryStatus = status;
+    detail.recoveryHost = "";
+    detail.recoveryStartedAt = 0;
+    detail.recoveryBaselineBuffer = 0;
     detail.recoveryHealthySegments = 0;
     detail.recoveryStrongTransfers = 0;
+  }
+
+  function beginRouteRecovery(detail, host) {
+    resetRouteRecovery(detail, "pending");
+    detail.recoveryHost = String(host ?? "").slice(0, 255);
+    detail.recoveryStartedAt = Date.now();
+    detail.recoveryBaselineBuffer = detail.lastBufferAhead;
     const requestSessionId = session.id;
     scheduleRouteRecoveryDeadline(detail, requestSessionId);
   }
@@ -640,7 +680,7 @@
       detail.recoveryStatus = "awaiting-evidence";
       addEvent(
         "route-recovery-awaiting",
-        detail.mediaHost,
+        detail.recoveryHost,
         `${detail.presentationId} ${detail.kind} ${detail.routeKey}`
       );
       recordSession();
@@ -652,6 +692,13 @@
     if (
       detail.recoveryStatus !== "pending" &&
       detail.recoveryStatus !== "awaiting-evidence"
+    ) {
+      return;
+    }
+    const observedHost = String(payload.host ?? "").toLowerCase();
+    if (
+      !detail.recoveryHost ||
+      observedHost !== detail.recoveryHost.toLowerCase()
     ) {
       return;
     }
@@ -700,8 +747,27 @@
 
   function recoverHost(detail) {
     const requestSessionId = session.id;
+    const recoveryHost = detail.recoveryHost;
+    const recoveryEvidence = {
+      startedAt: detail.recoveryStartedAt,
+      baselineBuffer: detail.recoveryBaselineBuffer,
+      healthySegments: detail.recoveryHealthySegments,
+      strongTransfers: detail.recoveryStrongTransfers
+    };
+    const recoveryIsCurrent = () =>
+      session.id === requestSessionId &&
+      detail.recoveryHost === recoveryHost &&
+      detail.recoveryStatus === "confirming";
     const resumePendingRecovery = () => {
-      if (session.id !== requestSessionId) {
+      if (!recoveryIsCurrent()) {
+        return;
+      }
+      if (
+        detail.mediaHost !== recoveryHost ||
+        !routeHostIsHalfOpen(detail, recoveryHost)
+      ) {
+        resetRouteRecovery(detail);
+        recordSession();
         return;
       }
       detail.recoveryStatus = "pending";
@@ -717,7 +783,7 @@
         type: "HOST_RECOVERED",
         sessionId: requestSessionId,
         ...(Number.isInteger(routingTabId) ? { routingTabId } : {}),
-        host: detail.mediaHost,
+        host: recoveryHost,
         presentationId: detail.presentationId,
         kind: detail.kind,
         routeKey: detail.routeKey,
@@ -725,59 +791,63 @@
         bufferAhead: detail.lastBufferAhead
       })
       .then((response) => {
-        if (
+        const responseMatches = Boolean(
           response?.ok &&
-          response.sessionId === session.id &&
-          response.config
-        ) {
+          response.sessionId === requestSessionId &&
+          session.id === requestSessionId
+        );
+        const wasCurrent = recoveryIsCurrent();
+        if (responseMatches && response.config) {
           dispatchConfig(response.config);
         }
-        if (
-          response?.ok &&
-          response.sessionId === session.id &&
-          response.config
-        ) {
-          dispatchConfig(response.config);
+        if (!wasCurrent) {
+          return;
         }
-        if (
-          response?.ok &&
-          response.sessionId === session.id &&
-          response.recovered
-        ) {
+        if (responseMatches && response.recovered) {
           detail.recoveryStatus = "recovered";
+          detail.recoveryHost = recoveryHost;
+          detail.recoveryStartedAt = recoveryEvidence.startedAt;
+          detail.recoveryBaselineBuffer = recoveryEvidence.baselineBuffer;
+          detail.recoveryHealthySegments = recoveryEvidence.healthySegments;
+          detail.recoveryStrongTransfers = recoveryEvidence.strongTransfers;
           addEvent(
             "route-recovered",
-            detail.mediaHost,
-            `${detail.presentationId} ${detail.kind} ${detail.routeKey}; ${detail.recoveryHealthySegments} segments`
+            recoveryHost,
+            `${detail.presentationId} ${detail.kind} ${detail.routeKey}; ${recoveryEvidence.healthySegments} segments; ${recoveryEvidence.strongTransfers} strong transfers`
           );
           session.activeRuleCount = Math.max(
             0,
             Number(response.ruleCount) || 0
           );
           applyResourceStats(response.resourceStats);
-          if (response.config) {
-            dispatchConfig(response.config);
-          }
           recordSession();
           return;
         }
-        if (session.id !== requestSessionId) {
+        if (
+          responseMatches &&
+          response.circuit === "static-open"
+        ) {
+          resetRouteRecovery(detail, "static-open");
+          addEvent(
+            "route-recovery-failed",
+            recoveryHost,
+            `${detail.presentationId} ${detail.kind} ${detail.routeKey}; static blocked host cannot recover; ${recoveryEvidence.healthySegments} segments; ${recoveryEvidence.strongTransfers} strong transfers`
+          );
+          recordSession();
           return;
         }
         if (
-          response?.ok &&
-          response.sessionId === session.id &&
-          response.circuit === "static-open"
+          responseMatches &&
+          ["closed", "open"].includes(response.circuit)
         ) {
-          detail.recoveryStatus = "static-open";
-          addEvent(
-            "route-recovery-failed",
-            detail.mediaHost,
-            `${detail.presentationId} ${detail.kind} ${detail.routeKey}; static blocked host cannot recover`
+          resetRouteRecovery(
+            detail,
+            response.circuit === "open" ? "open" : "idle"
           );
-          if (response.config) {
-            dispatchConfig(response.config);
-          }
+          recordSession();
+          return;
+        }
+        if (detail.recoveryHost !== recoveryHost) {
           recordSession();
           return;
         }
@@ -927,10 +997,62 @@
           response.sessionId === session.id &&
           response.config
         ) {
+          lastPlaybackHeartbeatAt = performance.now();
           dispatchConfig(response.config);
         }
       })
       .catch(() => null);
+  }
+
+  function keepPlaybackSessionAlive() {
+    if (
+      routingSuspended ||
+      !isPlaybackPage(session.pageUrl) ||
+      (
+        config &&
+        (
+          !config.settings?.globalEnabled ||
+          !config.settings?.acceleration?.enabled
+        )
+      )
+    ) {
+      return;
+    }
+    const now = performance.now();
+    if (
+      now - lastPlaybackHeartbeatAt <
+      PLAYBACK_SESSION_HEARTBEAT_MS
+    ) {
+      return;
+    }
+    lastPlaybackHeartbeatAt = now;
+    const requestSessionId = session.id;
+    chrome.runtime
+      .sendMessage({
+        type: "KEEP_PLAYBACK_SESSION",
+        sessionId: requestSessionId,
+        ...(Number.isInteger(routingTabId) ? { routingTabId } : {})
+      })
+      .then((response) => {
+        if (
+          requestSessionId !== session.id ||
+          response?.ok
+        ) {
+          return;
+        }
+        if (
+          /stale or unknown playback session/i.test(
+            String(response?.error ?? "")
+          )
+        ) {
+          return announceSession().then(() =>
+            requestSessionId === session.id
+              ? registerMediaRoutes(latestRoutes)
+              : null
+          );
+        }
+      })
+      .catch(() => {});
   }
 
   function stopPlaybackSession(previousSession) {
@@ -1915,6 +2037,26 @@
     }
   }
 
+  function diagnosticSessionSnapshot(pendingSession) {
+    const snapshot = JSON.parse(JSON.stringify(pendingSession));
+    if (pendingSession !== session) {
+      return snapshot;
+    }
+    const now = performance.now();
+    for (const videoState of activePlayers.values()) {
+      if (
+        videoState.sessionId === pendingSession.id &&
+        videoState.bufferingSince !== null
+      ) {
+        snapshot.bufferingMs += Math.max(
+          0,
+          now - videoState.bufferingSince
+        );
+      }
+    }
+    return snapshot;
+  }
+
   function flushDiagnosticSessions() {
     diagnosticTimer = null;
     if (
@@ -1925,8 +2067,7 @@
       return;
     }
     const snapshots = [...pendingDiagnosticSessions.values()].map(
-      (pendingSession) =>
-        JSON.parse(JSON.stringify(pendingSession))
+      diagnosticSessionSnapshot
     );
     pendingDiagnosticSessions.clear();
     for (const snapshot of snapshots) {
@@ -1948,6 +2089,7 @@
       nextIsPlaybackPage &&
       presentationMatchesPage(route?.presentationId, url)
     );
+    closeActiveBufferingIntervals(previousSession);
     recordSession();
     if (!nextIsPlaybackPage) {
       void stopPlaybackSession(previousSession);
@@ -1980,6 +2122,7 @@
     sessionPlayerSerial = 0;
     activePlayers.clear();
     sessionStartedPerformance = performance.now();
+    lastPlaybackHeartbeatAt = sessionStartedPerformance;
     if (nextIsPlaybackPage) {
       addEvent("session-start");
     }
@@ -2094,7 +2237,26 @@
         "",
         `${videoState.playerId} ${type}`
       );
-      return;
+      return false;
+    }
+    const bufferAhead = videoBufferAhead(video);
+    const readyState = Math.max(0, Number(video.readyState) || 0);
+    if (
+      bufferAhead > NETWORK_RISK_MAX_BUFFER_AHEAD_SECONDS ||
+      readyState >= 3
+    ) {
+      // A route switch cannot repair a decoder/compositor/player-clock stall
+      // when media covering the playhead is already available. Treating this
+      // as CDN failure makes the player abort a healthy request and reload the
+      // same buffered presentation, which amplifies the visible spinner.
+      addEvent(
+        "buffered-playback-stall",
+        route.mediaHost,
+        `${route.presentationId} ${route.kind} ${route.routeKey}; ${type}; buffer ${bufferAhead.toFixed(
+          2
+        )}s; ready ${readyState}; seeking ${Boolean(video.seeking)}`
+      );
+      return true;
     }
     const requestSessionId = session.id;
     chrome.runtime
@@ -2107,21 +2269,22 @@
         host: route.mediaHost,
         routeKey: route.routeKey,
         reason: type,
-        bufferAhead: videoBufferAhead(video)
+        bufferAhead,
+        readyState,
+        seeking: Boolean(video.seeking)
       })
       .then((response) => {
-        if (
+        const responseMatches =
           response?.ok &&
           response.sessionId === session.id &&
-          response.config
-        ) {
+          requestSessionId === session.id;
+        if (!responseMatches) {
+          return;
+        }
+        if (response.config) {
           dispatchConfig(response.config);
         }
-        if (
-          response?.ok &&
-          response.sessionId === session.id &&
-          response.escalated
-        ) {
+        if (response.escalated) {
           session.activeRuleCount = Math.max(
             0,
             Number(response.ruleCount) || 0
@@ -2137,12 +2300,24 @@
             `${route.presentationId} ${route.kind} ${route.routeKey}; ${session.activeRuleCount} rules`
           );
           if (response.exhausted === true) {
-            requestNativeRouteBypass(route, "playback-risk-exhausted");
+            // The proactive sweep covers only two candidates. Do not declare
+            // the exact route natively exhausted until recovery has rotated
+            // through the remaining bounded CDN pool.
+            requestRecoveryProbe(route);
           }
-          recordSession();
         }
+        addEvent(
+          "playback-risk",
+          route.mediaHost,
+          `${route.presentationId} ${route.kind} ${route.routeKey}; ${type}; count ${Math.max(
+            0,
+            Number(response.count) || 0
+          )}${response.escalated ? "; escalated" : ""}`
+        );
+        recordSession();
       })
       .catch(() => {});
+    return true;
   }
 
   function clearPlaybackRisk(videoState) {
@@ -2156,6 +2331,39 @@
     videoState.playbackRiskStartedAt = 0;
     videoState.playbackRiskBaselineTime = 0;
     videoState.playbackRiskBaselineBuffer = 0;
+  }
+
+  function closeBufferingInterval(
+    videoState,
+    targetSession = session,
+    now = performance.now()
+  ) {
+    if (
+      videoState?.sessionId !== targetSession.id ||
+      videoState.bufferingSince === null
+    ) {
+      return false;
+    }
+    targetSession.bufferingMs += Math.max(
+      0,
+      now - videoState.bufferingSince
+    );
+    videoState.bufferingSince = null;
+    videoState.bufferingSignals.clear();
+    videoState.playbackRiskEpisodeReported = false;
+    const detail = targetSession.playerDetails[videoState.playerId];
+    if (detail) {
+      detail.buffering = false;
+      detail.updatedAt = Date.now();
+    }
+    return true;
+  }
+
+  function closeActiveBufferingIntervals(targetSession = session) {
+    const now = performance.now();
+    for (const videoState of activePlayers.values()) {
+      closeBufferingInterval(videoState, targetSession, now);
+    }
   }
 
   function schedulePlaybackRisk(type, video) {
@@ -2184,7 +2392,8 @@
         videoStates.get(video) !== videoState ||
         document.hidden ||
         video.paused ||
-        video.ended
+        video.ended ||
+        video.seeking
       ) {
         clearPlaybackRisk(videoState);
         return;
@@ -2241,6 +2450,7 @@
       return;
     }
     clearPlaybackRisk(videoState);
+    closeBufferingInterval(videoState);
     activePlayers.delete(video);
     delete session.playerDetails[videoState.playerId];
     videoState.active = false;
@@ -2294,6 +2504,7 @@
     ) {
       return;
     }
+    closeActiveBufferingIntervals(session);
     addEvent("lifecycle-suspend", "", reason);
     recordSession();
     flushDiagnosticSessions();
@@ -2363,6 +2574,8 @@
         kind: "video",
         mediaHost: "",
         bufferingSince: null,
+        bufferingSignals: new Set(),
+        playbackRiskEpisodeReported: false,
         waitingCount: 0,
         stalledCount: 0,
         playbackSeconds: 0,
@@ -2428,6 +2641,22 @@
     let route = currentRouteKey
       ? routes.find((entry) => entry.routeKey === currentRouteKey)
       : null;
+    if (
+      !route &&
+      !currentRouteKey &&
+      videoState.presentationId &&
+      videoState.routeKey
+    ) {
+      // Bilibili's MSE player exposes a blob: URL. Once that player has been
+      // tied to an observed exact route, keep the binding even if an ad or
+      // preloader later creates another <video> and uniqueness inference is
+      // no longer available.
+      route = routes.find(
+        (entry) =>
+          entry.presentationId === videoState.presentationId &&
+          entry.routeKey === videoState.routeKey
+      );
+    }
     if (!route && routes.length === 1) {
       route = routes[0];
     }
@@ -2503,14 +2732,32 @@
         return;
       }
       resolveVideoRoute(video, videoState);
-      videoState.waitingCount += 1;
-      session.waitingCount += 1;
       if (videoState.bufferingSince === null) {
         videoState.bufferingSince = performance.now();
+        videoState.bufferingSignals.clear();
+        videoState.playbackRiskEpisodeReported = false;
+      }
+      if (!videoState.bufferingSignals.has("waiting")) {
+        videoState.bufferingSignals.add("waiting");
+        videoState.waitingCount += 1;
+        session.waitingCount += 1;
+        addEvent("waiting", "", videoState.playerId);
+      }
+      if (
+        !videoState.playbackRiskEpisodeReported
+      ) {
+        // One transient episode is only evidence. The background opens the
+        // route after a second episode in 15 seconds, while the sustained
+        // timer below still escalates one uninterrupted 2.5 second stall.
+        videoState.playbackRiskEpisodeReported = reportPlaybackRisk(
+          video.seeking ? "seeking-waiting" : "waiting",
+          video
+        );
       }
       syncPlayerDetail(videoState, video);
-      addEvent("waiting", "", videoState.playerId);
-      schedulePlaybackRisk("waiting", video);
+      if (!video.seeking) {
+        schedulePlaybackRisk("waiting", video);
+      }
       recordSession();
     });
     video.addEventListener("stalled", () => {
@@ -2519,14 +2766,29 @@
         return;
       }
       resolveVideoRoute(video, videoState);
-      videoState.stalledCount += 1;
-      session.stalledCount += 1;
       if (videoState.bufferingSince === null) {
         videoState.bufferingSince = performance.now();
+        videoState.bufferingSignals.clear();
+        videoState.playbackRiskEpisodeReported = false;
+      }
+      if (!videoState.bufferingSignals.has("stalled")) {
+        videoState.bufferingSignals.add("stalled");
+        videoState.stalledCount += 1;
+        session.stalledCount += 1;
+        addEvent("stalled", "", videoState.playerId);
+      }
+      if (
+        !videoState.playbackRiskEpisodeReported
+      ) {
+        videoState.playbackRiskEpisodeReported = reportPlaybackRisk(
+          video.seeking ? "seeking-stalled" : "stalled",
+          video
+        );
       }
       syncPlayerDetail(videoState, video);
-      addEvent("stalled", "", videoState.playerId);
-      schedulePlaybackRisk("stalled", video);
+      if (!video.seeking) {
+        schedulePlaybackRisk("stalled", video);
+      }
       recordSession();
     });
     video.addEventListener("playing", () => {
@@ -2537,6 +2799,7 @@
       if (routingSuspended) {
         void resumeRouting();
       }
+      keepPlaybackSessionAlive();
       clearTimeout(lifecycleTimer);
       lifecycleTimer = null;
       clearPlaybackRisk(videoState);
@@ -2547,10 +2810,7 @@
         );
         addEvent("first-playing", "", `${session.firstPlayingMs}ms`);
       }
-      if (videoState.bufferingSince !== null) {
-        session.bufferingMs += performance.now() - videoState.bufferingSince;
-        videoState.bufferingSince = null;
-      }
+      closeBufferingInterval(videoState);
       syncPlayerDetail(videoState, video);
       recordSession();
     });
@@ -2560,6 +2820,7 @@
         return;
       }
       resolveVideoRoute(video, videoState);
+      keepPlaybackSessionAlive();
       if (
         videoState.playbackRiskTimer &&
         (Number(video.currentTime) || 0) >
@@ -2745,6 +3006,14 @@
       routingTabId = nextConfig.routingTabId;
     }
     config = nextConfig;
+    for (const detail of Object.values(session.routeDetails)) {
+      if (
+        detail.recoveryHost &&
+        !routeHostIsHalfOpen(detail, detail.recoveryHost)
+      ) {
+        resetRouteRecovery(detail);
+      }
+    }
     applyResourceStats(nextConfig.resourceStats);
     const pageConfig = { ...nextConfig };
     delete pageConfig.healthyHosts;
@@ -2765,7 +3034,7 @@
     }
     if (cosmeticEnabled && safeSelectors.length) {
       const style = document.createElement("style");
-      style.dataset.biliOverseaAccel = "cosmetic";
+      style.dataset.bilibiliSpeedup = "cosmetic";
       style.textContent = safeSelectors
         .map((selector) => `${selector}{display:none!important;}`)
         .join("\n");
@@ -3086,6 +3355,33 @@
           probeId,
           sessionId: session.id,
           found
+        });
+        return false;
+      }
+      if (message?.type === "CAPTURE_DIAGNOSTIC_SNAPSHOT") {
+        if (
+          message.version !== 1 ||
+          message.sessionId !== session.id ||
+          !isPlaybackPage(session.pageUrl) ||
+          !config?.settings?.globalEnabled ||
+          !config.settings.diagnostics.enabled
+        ) {
+          sendResponse({
+            ok: false,
+            type: "DIAGNOSTIC_SNAPSHOT",
+            version: 1,
+            sessionId: session.id,
+            error: "Diagnostic collection is not active for this session"
+          });
+          return false;
+        }
+        session.updatedAt = Date.now();
+        sendResponse({
+          ok: true,
+          type: "DIAGNOSTIC_SNAPSHOT",
+          version: 1,
+          sessionId: session.id,
+          session: diagnosticSessionSnapshot(session)
         });
         return false;
       }

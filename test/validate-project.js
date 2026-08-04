@@ -11,6 +11,10 @@ import { isSafeCosmeticSelector } from "../src/lib/cosmetic.js";
 import { compileDynamicRules, MAX_DYNAMIC_RULES } from "../src/lib/dnr.js";
 import { normalizeSettings } from "../src/lib/defaults.js";
 import {
+  CJK_PATTERN,
+  translateToEnglish
+} from "../scripts/ui-en-locale.js";
+import {
   isAllowedMediaHostname,
   isAllowedMediaUrl
 } from "../src/lib/url-utils.js";
@@ -238,6 +242,56 @@ assert.equal(
 assert.ok(
   existsSync(path.join(root, "scripts/build-release.js")),
   "Missing release builder"
+);
+
+const releaseDirectory = path.join(root, "release");
+const englishReleaseDirectory = path.join(root, "release-en");
+assert.ok(existsSync(releaseDirectory), "Missing Traditional Chinese release");
+assert.ok(existsSync(englishReleaseDirectory), "Missing English release");
+const relativeBundleFiles = (directory) =>
+  walk(directory)
+    .map((file) => path.relative(directory, file).split(path.sep).join("/"))
+    .sort();
+assert.deepEqual(
+  relativeBundleFiles(englishReleaseDirectory),
+  relativeBundleFiles(releaseDirectory),
+  "English and Traditional Chinese bundles must contain the same files"
+);
+const builtReleaseManifest = json("release/manifest.json");
+const builtEnglishManifest = json("release-en/manifest.json");
+assert.equal(builtReleaseManifest.version, packageJson.version);
+assert.equal(builtEnglishManifest.version, packageJson.version);
+const englishUiFiles = [
+  "rules/blocked-endpoints.json",
+  "src/ui/diagnostics.html",
+  "src/ui/diagnostics.js",
+  "src/ui/options.html",
+  "src/ui/options.js",
+  "src/ui/popup.html",
+  "src/ui/popup.js"
+];
+for (const relativePath of englishUiFiles) {
+  const source = readFileSync(path.join(root, relativePath), "utf8");
+  const translated = translateToEnglish(source);
+  assert.equal(
+    CJK_PATTERN.test(translated),
+    false,
+    `Untranslated English UI text in ${relativePath}`
+  );
+  assert.equal(
+    readFileSync(path.join(englishReleaseDirectory, relativePath), "utf8"),
+    translated,
+    `Stale English release file: ${relativePath}`
+  );
+}
+const expectedEnglishManifest = translateToEnglish(
+  `${JSON.stringify(releaseManifest, null, 2)}\n`
+);
+assert.equal(CJK_PATTERN.test(expectedEnglishManifest), false);
+assert.equal(
+  readFileSync(path.join(englishReleaseDirectory, "manifest.json"), "utf8"),
+  expectedEnglishManifest,
+  "Stale English release manifest"
 );
 
 console.log(

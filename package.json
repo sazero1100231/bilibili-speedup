@@ -1,6 +1,6 @@
 {
   "name": "bilibili-speedup",
-  "version": "1.1.17",
+  "version": "1.1.21",
   "private": true,
   "type": "module",
   "description": "Bilibili overseas playback accelerator and tracking cleaner (Manifest V3)",
