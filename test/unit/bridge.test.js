@@ -107,7 +107,7 @@ async function createHarness(options = {}) {
       chrome,
       crypto,
       performance: {
-        now: () => 0,
+        now: options.performanceNow ?? (() => 0),
         getEntriesByType: () => []
       },
       MutationObserver,
@@ -1337,7 +1337,7 @@ test("events from an old video element cannot contaminate the next session", asy
   harness.video.dispatchEvent(new Event("waiting"));
   assert.equal(
     harness.messages.filter((message) => message.type === "PLAYBACK_RISK").length,
-    0
+    1
   );
 });
 
@@ -1552,13 +1552,13 @@ test("a single MSE player attributes waiting to the latest observed page video r
     harness.messages.filter(
       (message) => message.type === "PLAYBACK_RISK"
     ).length,
-    0
+    1
   );
   riskCallback();
   const risks = harness.messages.filter(
     (message) => message.type === "PLAYBACK_RISK"
   );
-  assert.equal(risks.length, 1);
+  assert.equal(risks.length, 2);
   assert.ok(
     risks.every(
       (message) =>
@@ -1584,6 +1584,42 @@ test("a single MSE player attributes waiting to the latest observed page video r
       (event) => event.type === "player-route-inferred"
     )
   );
+});
+
+test("an MSE player keeps its exact route after a second video becomes active", async () => {
+  const presentationId = "bvid-BV1234567890";
+  const harness = await createHarness({
+    videoCount: 2,
+    pageUrl: "https://www.bilibili.com/video/BV1234567890",
+    videoSources: [
+      "blob:https://www.bilibili.com/main-player",
+      "blob:https://www.bilibili.com/aux-player"
+    ]
+  });
+  harness.emitMainMessage("MEDIA_HOST", {
+    presentationId,
+    routeKey: "/path/selected-video.m4s",
+    kind: "video",
+    host: "upos-hz-mirrorakam.akamaized.net"
+  });
+  harness.emitMainMessage("MEDIA_HOST", {
+    presentationId,
+    routeKey: "/path/selected-audio.m4s",
+    kind: "audio",
+    host: "upos-hz-mirrorakam.akamaized.net"
+  });
+
+  harness.videos[0].dispatchEvent(new Event("loadstart"));
+  harness.videos[1].dispatchEvent(new Event("loadstart"));
+  harness.videos[0].dispatchEvent(new Event("waiting"));
+
+  const risks = harness.messages.filter(
+    (message) => message.type === "PLAYBACK_RISK"
+  );
+  assert.equal(risks.length, 1);
+  assert.equal(risks[0].presentationId, presentationId);
+  assert.equal(risks[0].routeKey, "/path/selected-video.m4s");
+  assert.equal(risks[0].host, "upos-hz-mirrorakam.akamaized.net");
 });
 
 test("diagnostics retain the first planned route separately from the actual host", async () => {
@@ -1798,6 +1834,96 @@ test("DASH audio and video hosts do not inflate each other's route switch count"
   );
 });
 
+test("an ordinary failover never starts half-open recovery", async () => {
+  let recoveryCallback;
+  const harness = await createHarness({
+    setTimeout(callback, delay) {
+      if (delay === 1000) {
+        queueMicrotask(callback);
+      } else if (delay === 5000) {
+        recoveryCallback = callback;
+      }
+      return 1;
+    },
+    sendMessage(message) {
+      if (
+        message.type === "START_PLAYBACK_SESSION" ||
+        message.type === "GET_RUNTIME_CONFIG"
+      ) {
+        return Promise.resolve({
+          ok: true,
+          sessionId: message.sessionId,
+          config: {
+            playbackSessionId: message.sessionId,
+            settings: {
+              globalEnabled: true,
+              diagnostics: { enabled: true },
+              privacy: { cosmeticFiltering: false, urlCleaning: false }
+            },
+            cosmeticSelectors: [],
+            halfOpenRoutes: {}
+          }
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        sessionId: message.sessionId,
+        circuit: "closed",
+        recovered: false
+      });
+    }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const route = {
+    presentationId: "bvid-BVFAILOVER1:cid-1",
+    routeKey: "/path/failover.m4s",
+    kind: "video"
+  };
+  harness.emitMainMessage("ROUTE_MANIFEST", {
+    routes: [
+      {
+        ...route,
+        urls: [
+          "https://upos-sz-mirrorcos.bilivideo.com/path/failover.m4s?a=1",
+          "https://upos-hz-mirrorakam.akamaized.net/path/failover.m4s?b=2"
+        ]
+      }
+    ]
+  });
+  for (const [host, bufferAhead] of [
+    ["upos-sz-mirrorcos.bilivideo.com", 0],
+    ["upos-hz-mirrorakam.akamaized.net", 0],
+    ["upos-hz-mirrorakam.akamaized.net", 2]
+  ]) {
+    harness.emitMainMessage("MEDIA_REQUEST_RESULT", {
+      ...route,
+      host,
+      status: 206,
+      bytes: 262_144,
+      bufferAhead
+    });
+  }
+  await Promise.resolve();
+
+  const latest = harness.messages
+    .filter((message) => message.type === "RECORD_DIAGNOSTIC")
+    .at(-1)?.session;
+  const detail = Object.values(latest.routeDetails)[0];
+  assert.equal(detail.routeSwitchCount, 1);
+  assert.equal(detail.recoveryStatus, "idle");
+  assert.equal(detail.recoveryHost, "");
+  assert.equal(recoveryCallback, undefined);
+  assert.equal(
+    harness.messages.some((message) => message.type === "HOST_RECOVERED"),
+    false
+  );
+  assert.equal(
+    latest.ordinaryEvents.some(
+      (event) => event.type === "route-recovery-awaiting"
+    ),
+    false
+  );
+});
 test("a route switch needs two healthy segments and buffer progress to recover", async () => {
   const harness = await createHarness({
     sendMessage(message) {
@@ -1818,14 +1944,39 @@ test("a route switch needs two healthy segments and buffer progress to recover",
                 urlCleaning: false
               }
             },
-            cosmeticSelectors: []
+            cosmeticSelectors: [],
+            halfOpenRoutes: {
+              "BV1:cid-1::/path/video.m4s": [
+                "upos-hz-mirrorakam.akamaized.net"
+              ]
+            }
+          }
+        });
+      }
+      if (message.type === "HOST_RECOVERED") {
+        return Promise.resolve({
+          ok: true,
+          sessionId: message.sessionId,
+          recovered: true,
+          config: {
+            playbackSessionId: message.sessionId,
+            settings: {
+              globalEnabled: true,
+              diagnostics: { enabled: true },
+              privacy: {
+                cosmeticFiltering: false,
+                urlCleaning: false
+              }
+            },
+            cosmeticSelectors: [],
+            halfOpenRoutes: {}
           }
         });
       }
       return Promise.resolve({
         ok: true,
         sessionId: message.sessionId,
-        recovered: message.type === "HOST_RECOVERED"
+        recovered: false
       });
     }
   });
@@ -1881,8 +2032,14 @@ test("a route switch needs two healthy segments and buffer progress to recover",
     .at(-1)?.session;
   const detail = Object.values(latest.routeDetails)[0];
   assert.equal(detail.routeSwitchCount, 1);
-  assert.equal(detail.recoveryHealthySegments, 2);
   assert.equal(detail.recoveryStatus, "recovered");
+  assert.equal(
+    detail.recoveryHost,
+    "upos-hz-mirrorakam.akamaized.net"
+  );
+  assert.equal(detail.recoveryHealthySegments, 2);
+  assert.equal(detail.recoveryStrongTransfers, 0);
+  assert.ok(detail.recoveryStartedAt > 0);
   const recovered = harness.messages.find(
     (message) => message.type === "HOST_RECOVERED"
   );
@@ -1901,7 +2058,12 @@ test("a route switch needs two healthy segments and buffer progress to recover",
     latest.criticalEvents.some((event) => event.type === "route-switch")
   );
   assert.ok(
-    latest.criticalEvents.some((event) => event.type === "route-recovered")
+    latest.criticalEvents.some(
+      (event) =>
+        event.type === "route-recovered" &&
+        event.host === "upos-hz-mirrorakam.akamaized.net" &&
+        event.detail.includes("2 segments; 0 strong transfers")
+    )
   );
   assert.equal(
     latest.criticalEvents.some((event) => event.type === "beacon-blocked"),
@@ -1926,7 +2088,12 @@ test("a static blocked host cannot be reported recovered before policy confirmat
               diagnostics: { enabled: true },
               privacy: { cosmeticFiltering: false, urlCleaning: false }
             },
-            cosmeticSelectors: []
+            cosmeticSelectors: [],
+            halfOpenRoutes: {
+              "bvid-BVSTATIC:cid-1::/path/static.m4s": [
+                "upos-sz-mirroraliov.bilivideo.com"
+              ]
+            }
           }
         });
       }
@@ -2179,7 +2346,12 @@ test("paused or hidden playback defers the recovery deadline instead of degradin
               diagnostics: { enabled: true },
               privacy: { cosmeticFiltering: false, urlCleaning: false }
             },
-            cosmeticSelectors: []
+            cosmeticSelectors: [],
+            halfOpenRoutes: {
+              "bvid-BVPAUSED001:cid-1::/path/pause.m4s": [
+                "upos-hz-mirrorakam.akamaized.net"
+              ]
+            }
           }
         });
       }
@@ -2278,7 +2450,12 @@ test("recovery silence stays unconfirmed instead of degrading after five seconds
                 urlCleaning: false
               }
             },
-            cosmeticSelectors: []
+            cosmeticSelectors: [],
+            halfOpenRoutes: {
+              "BV-timeout:cid-1::/path/timeout.m4s": [
+                "upos-hz-mirrorakam.akamaized.net"
+              ]
+            }
           }
         });
       }
@@ -2421,7 +2598,7 @@ test("two video elements retain independent waiting and playback-risk attributio
   const risks = harness.messages.filter(
     (message) => message.type === "PLAYBACK_RISK"
   );
-  assert.equal(risks.length, 2);
+  assert.equal(risks.length, 4);
   assert.deepEqual(
     risks.map((message) => ({
       presentationId: message.presentationId,
@@ -2429,6 +2606,16 @@ test("two video elements retain independent waiting and playback-risk attributio
       host: message.host
     })),
     [
+      {
+        presentationId: "presentation-a",
+        routeKey: "/path/player-a.m4s",
+        host: "upos-sz-mirrorcos.bilivideo.com"
+      },
+      {
+        presentationId: "presentation-b",
+        routeKey: "/path/player-b.m4s",
+        host: "upos-hz-mirrorakam.akamaized.net"
+      },
       {
         presentationId: "presentation-a",
         routeKey: "/path/player-a.m4s",
@@ -2524,8 +2711,8 @@ test("repeated loadstart keeps the main player identity and active-player quota"
   const risks = harness.messages.filter(
     (message) => message.type === "PLAYBACK_RISK"
   );
-  assert.equal(risks.length, 1);
-  assert.equal(risks[0].routeKey, "/path/player.m4s");
+  assert.equal(risks.length, 2);
+  assert.ok(risks.every((risk) => risk.routeKey === "/path/player.m4s"));
   const latest = harness.messages
     .filter((message) => message.type === "RECORD_DIAGNOSTIC")
     .at(-1)?.session;
@@ -3112,7 +3299,12 @@ test("two full high-capacity transfers recover without synthetic buffer growth",
               diagnostics: { enabled: true },
               privacy: { cosmeticFiltering: false, urlCleaning: false }
             },
-            cosmeticSelectors: []
+            cosmeticSelectors: [],
+            halfOpenRoutes: {
+              "bvid-BVCAPACITY1::/path/capacity.m4s": [
+                "upos-hz-mirrorakam.akamaized.net"
+              ]
+            }
           }
         });
       }
@@ -3170,7 +3362,7 @@ test("two full high-capacity transfers recover without synthetic buffer growth",
   );
 });
 
-test("playing cancels a pending transient waiting risk", async () => {
+test("playing cancels the sustained follow-up after one transient waiting risk", async () => {
   let riskCallback;
   const harness = await createHarness({
     withVideo: true,
@@ -3192,11 +3384,492 @@ test("playing cancels a pending transient waiting risk", async () => {
   harness.video.dispatchEvent(new Event("playing"));
   riskCallback();
   assert.equal(
-    harness.messages.some((message) => message.type === "PLAYBACK_RISK"),
+    harness.messages.filter(
+      (message) => message.type === "PLAYBACK_RISK"
+    ).length,
+    1
+  );
+});
+
+test("two transient waiting episodes reach background route escalation", async () => {
+  let riskCallback;
+  let riskCount = 0;
+  const harness = await createHarness({
+    withVideo: true,
+    setTimeout(callback, delay) {
+      if (delay === 2500) {
+        riskCallback = callback;
+      }
+      return 1;
+    },
+    sendMessage(message) {
+      if (message.type === "PLAYBACK_RISK") {
+        riskCount += 1;
+        return Promise.resolve({
+          ok: true,
+          sessionId: message.sessionId,
+          count: riskCount,
+          escalated: riskCount === 2,
+          ruleCount: riskCount === 2 ? 1 : 0
+        });
+      }
+      return Promise.resolve({ ok: true, sessionId: message.sessionId });
+    }
+  });
+  harness.emitMainMessage("MEDIA_HOST", {
+    presentationId: "bvid-BVREBUFFER1",
+    routeKey: "/path/rebuffer.m4s",
+    kind: "video",
+    host: "upos-hz-mirrorakam.akamaized.net"
+  });
+  harness.video.dispatchEvent(new Event("loadstart"));
+  harness.video.dispatchEvent(new Event("waiting"));
+  harness.video.dispatchEvent(new Event("playing"));
+  await Promise.resolve();
+  harness.video.dispatchEvent(new Event("waiting"));
+  await Promise.resolve();
+
+  assert.equal(
+    harness.messages.filter(
+      (message) => message.type === "PLAYBACK_RISK"
+    ).length,
+    2
+  );
+  assert.equal(riskCount, 2);
+  riskCallback();
+});
+
+test("playback-risk exhaustion sweeps remaining candidates before native bypass", async () => {
+  const presentationId = "bvid-BV1234567890";
+  const routeKey = "/path/risk-recovery.m4s";
+  const mediaUrl =
+    "https://upos-hz-mirrorakam.akamaized.net/path/risk-recovery.m4s?token=1";
+  let riskCount = 0;
+  const harness = await createHarness({
+    withVideo: true,
+    pageUrl: "https://www.bilibili.com/video/BV1234567890",
+    sendMessage(message) {
+      if (message.type === "PLAYBACK_RISK") {
+        riskCount += 1;
+        return Promise.resolve({
+          ok: true,
+          sessionId: message.sessionId,
+          count: riskCount,
+          escalated: riskCount === 2,
+          exhausted: riskCount === 2,
+          ruleCount: 1
+        });
+      }
+      if (message.type === "PROBE_MEDIA") {
+        return Promise.resolve({
+          ok: false,
+          error: "synthetic recovery pause"
+        });
+      }
+      return Promise.resolve({ ok: true, sessionId: message.sessionId });
+    }
+  });
+  harness.emitMainMessage("ROUTE_MANIFEST", {
+    routes: [
+      {
+        presentationId,
+        routeKey,
+        kind: "video",
+        urls: [mediaUrl]
+      }
+    ]
+  });
+  harness.emitMainMessage("MEDIA_HOST", {
+    presentationId,
+    routeKey,
+    kind: "video",
+    host: "upos-hz-mirrorakam.akamaized.net"
+  });
+  harness.video.dispatchEvent(new Event("loadstart"));
+  harness.video.dispatchEvent(new Event("waiting"));
+  harness.video.dispatchEvent(new Event("playing"));
+  harness.video.dispatchEvent(new Event("waiting"));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const recoveryProbes = harness.messages.filter(
+    (message) => message.type === "PROBE_MEDIA" && message.recovery === true
+  );
+  assert.equal(recoveryProbes.length, 1);
+  assert.equal(recoveryProbes[0].presentationId, presentationId);
+  assert.equal(recoveryProbes[0].routeKey, routeKey);
+  assert.equal(
+    harness.messages.some(
+      (message) => message.type === "BYPASS_PLAYBACK_ROUTE"
+    ),
     false
   );
 });
 
+test("active playback sends a bounded heartbeat before background routing expires", async () => {
+  let now = 0;
+  const harness = await createHarness({
+    withVideo: true,
+    performanceNow: () => now
+  });
+  harness.video.dispatchEvent(new Event("loadstart"));
+  now = 29_999;
+  harness.video.dispatchEvent(new Event("timeupdate"));
+  assert.equal(
+    harness.messages.some(
+      (message) => message.type === "KEEP_PLAYBACK_SESSION"
+    ),
+    false
+  );
+  now = 30_001;
+  harness.video.dispatchEvent(new Event("timeupdate"));
+  now = 30_500;
+  harness.video.dispatchEvent(new Event("timeupdate"));
+  assert.equal(
+    harness.messages.filter(
+      (message) => message.type === "KEEP_PLAYBACK_SESSION"
+    ).length,
+    1
+  );
+});
+
+test("duplicate waiting signals count one buffering episode", async () => {
+  const harness = await createHarness({
+    withVideo: true,
+    sendMessage(message) {
+      if (
+        message.type === "START_PLAYBACK_SESSION" ||
+        message.type === "GET_RUNTIME_CONFIG"
+      ) {
+        return Promise.resolve({
+          ok: true,
+          sessionId: message.sessionId,
+          config: {
+            playbackSessionId: message.sessionId,
+            settings: {
+              globalEnabled: true,
+              diagnostics: { enabled: true },
+              privacy: {
+                cosmeticFiltering: false,
+                urlCleaning: false
+              }
+            },
+            cosmeticSelectors: []
+          }
+        });
+      }
+      return Promise.resolve({ ok: true, sessionId: message.sessionId });
+    }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  harness.emitMainMessage("MEDIA_HOST", {
+    presentationId: "bvid-BVDEDUP1",
+    routeKey: "/path/dedup.m4s",
+    kind: "video",
+    host: "upos-hz-mirrorakam.akamaized.net"
+  });
+  harness.video.dispatchEvent(new Event("loadstart"));
+  harness.video.dispatchEvent(new Event("waiting"));
+  harness.video.dispatchEvent(new Event("waiting"));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const latest = harness.messages
+    .filter((message) => message.type === "RECORD_DIAGNOSTIC")
+    .at(-1)?.session;
+  assert.equal(latest.waitingCount, 1);
+  assert.equal(latest.playerDetails["player-1"].waitingCount, 1);
+  assert.equal(
+    latest.criticalEvents.filter((event) => event.type === "waiting").length,
+    1
+  );
+  assert.equal(
+    harness.messages.filter(
+      (message) => message.type === "PLAYBACK_RISK"
+    ).length,
+    1
+  );
+});
+
+test("buffered playable waiting is diagnostic-only and cannot switch CDN", async () => {
+  const harness = await createHarness({
+    withVideo: true,
+    sendMessage(message) {
+      if (
+        message.type === "START_PLAYBACK_SESSION" ||
+        message.type === "GET_RUNTIME_CONFIG"
+      ) {
+        return Promise.resolve({
+          ok: true,
+          sessionId: message.sessionId,
+          config: {
+            playbackSessionId: message.sessionId,
+            settings: {
+              globalEnabled: true,
+              diagnostics: { enabled: true },
+              privacy: {
+                cosmeticFiltering: false,
+                urlCleaning: false
+              }
+            },
+            cosmeticSelectors: []
+          }
+        });
+      }
+      return Promise.resolve({ ok: true, sessionId: message.sessionId });
+    }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  harness.emitMainMessage("MEDIA_HOST", {
+    presentationId: "bvid-BVBUFFERED1",
+    routeKey: "/path/buffered.m4s",
+    kind: "video",
+    host: "upos-hz-mirrorakam.akamaized.net"
+  });
+  harness.video.currentTime = 5;
+  harness.video.readyState = 4;
+  harness.video.buffered = {
+    length: 1,
+    start: () => 0,
+    end: () => 25
+  };
+  harness.video.dispatchEvent(new Event("loadstart"));
+  harness.video.seeking = true;
+  harness.video.dispatchEvent(new Event("waiting"));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(
+    harness.messages.filter(
+      (message) => message.type === "PLAYBACK_RISK"
+    ).length,
+    0
+  );
+  const latest = harness.messages
+    .filter((message) => message.type === "RECORD_DIAGNOSTIC")
+    .at(-1)?.session;
+  const bufferedStall = latest.criticalEvents.find(
+    (event) => event.type === "buffered-playback-stall"
+  );
+  assert.match(bufferedStall.detail, /buffer 20\.00s; ready 4; seeking true/);
+});
+
+test("seeking contributes one risk but cannot start its sustained follow-up", async () => {
+  let riskCallback;
+  const harness = await createHarness({
+    withVideo: true,
+    setTimeout(callback, delay) {
+      if (delay === 2500) {
+        riskCallback = callback;
+      }
+      return 1;
+    }
+  });
+  harness.emitMainMessage("MEDIA_HOST", {
+    presentationId: "bvid-BVSEEK1",
+    routeKey: "/path/seek.m4s",
+    kind: "video",
+    host: "upos-hz-mirrorakam.akamaized.net"
+  });
+  harness.video.dispatchEvent(new Event("loadstart"));
+  harness.video.seeking = true;
+  harness.video.dispatchEvent(new Event("waiting"));
+  assert.equal(riskCallback, undefined);
+  assert.equal(
+    harness.messages.filter(
+      (message) => message.type === "PLAYBACK_RISK"
+    ).length,
+    1
+  );
+  assert.equal(
+    harness.messages.find(
+      (message) => message.type === "PLAYBACK_RISK"
+    ).reason,
+    "seeking-waiting"
+  );
+
+  harness.video.seeking = false;
+  harness.video.dispatchEvent(new Event("stalled"));
+  assert.equal(
+    harness.messages.filter(
+      (message) => message.type === "PLAYBACK_RISK"
+    ).length,
+    1
+  );
+  riskCallback();
+  assert.equal(
+    harness.messages.filter(
+      (message) => message.type === "PLAYBACK_RISK"
+    ).length,
+    2
+  );
+});
+
+test("repeated seeking waits remain eligible for background escalation", async () => {
+  const harness = await createHarness({ withVideo: true });
+  harness.emitMainMessage("MEDIA_HOST", {
+    presentationId: "bvid-BVSEEK2",
+    routeKey: "/path/repeated-seek.m4s",
+    kind: "video",
+    host: "upos-hz-mirrorakam.akamaized.net"
+  });
+  harness.video.dispatchEvent(new Event("loadstart"));
+  harness.video.seeking = true;
+  harness.video.dispatchEvent(new Event("waiting"));
+  harness.video.dispatchEvent(new Event("playing"));
+  harness.video.dispatchEvent(new Event("waiting"));
+
+  const risks = harness.messages.filter(
+    (message) => message.type === "PLAYBACK_RISK"
+  );
+  assert.equal(risks.length, 2);
+  assert.ok(risks.every((message) => message.reason === "seeking-waiting"));
+});
+
+test("diagnostic export includes an in-progress buffering interval", async () => {
+  let now = 0;
+  const harness = await createHarness({
+    withVideo: true,
+    performanceNow: () => now,
+    sendMessage(message) {
+      if (
+        message.type === "START_PLAYBACK_SESSION" ||
+        message.type === "GET_RUNTIME_CONFIG"
+      ) {
+        return Promise.resolve({
+          ok: true,
+          sessionId: message.sessionId,
+          config: {
+            playbackSessionId: message.sessionId,
+            settings: {
+              globalEnabled: true,
+              diagnostics: { enabled: true },
+              privacy: {
+                cosmeticFiltering: false,
+                urlCleaning: false
+              }
+            },
+            cosmeticSelectors: []
+          }
+        });
+      }
+      return Promise.resolve({ ok: true, sessionId: message.sessionId });
+    }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  harness.video.dispatchEvent(new Event("loadstart"));
+  now = 1_000;
+  harness.video.dispatchEvent(new Event("waiting"));
+  now = 4_200;
+
+  const sessionId = harness.messages.find(
+    (message) => message.type === "START_PLAYBACK_SESSION"
+  ).sessionId;
+  const response = await harness.requestRuntimeMessage({
+    type: "CAPTURE_DIAGNOSTIC_SNAPSHOT",
+    version: 1,
+    sessionId
+  });
+  assert.equal(response.ok, true);
+  assert.equal(response.session.bufferingMs, 3_200);
+  assert.equal(response.session.playerDetails["player-1"].buffering, true);
+});
+
+test("an active diagnostic session returns a synchronous export snapshot", async () => {
+  const harness = await createHarness({
+    pageUrl:
+      "https://www.bilibili.com/video/BVSNAPSHOT?from=private#fragment",
+    sendMessage(message) {
+      if (
+        message.type === "START_PLAYBACK_SESSION" ||
+        message.type === "GET_RUNTIME_CONFIG"
+      ) {
+        return Promise.resolve({
+          ok: true,
+          sessionId: message.sessionId,
+          config: {
+            playbackSessionId: message.sessionId,
+            settings: {
+              globalEnabled: true,
+              diagnostics: { enabled: true },
+              privacy: {
+                cosmeticFiltering: false,
+                urlCleaning: false
+              }
+            },
+            cosmeticSelectors: []
+          }
+        });
+      }
+      return Promise.resolve({ ok: true });
+    }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const started = harness.messages.find(
+    (message) => message.type === "START_PLAYBACK_SESSION"
+  );
+  const snapshot = await harness.requestRuntimeMessage({
+    type: "CAPTURE_DIAGNOSTIC_SNAPSHOT",
+    version: 1,
+    sessionId: started.sessionId
+  });
+
+  assert.equal(snapshot.ok, true);
+  assert.equal(snapshot.type, "DIAGNOSTIC_SNAPSHOT");
+  assert.equal(snapshot.version, 1);
+  assert.equal(snapshot.sessionId, started.sessionId);
+  assert.equal(snapshot.session.id, started.sessionId);
+  assert.equal(
+    snapshot.session.pageUrl,
+    "https://www.bilibili.com/video/BVSNAPSHOT"
+  );
+  assert.ok(snapshot.session.updatedAt >= snapshot.session.startedAt);
+
+  const mismatched = await harness.requestRuntimeMessage({
+    type: "CAPTURE_DIAGNOSTIC_SNAPSHOT",
+    version: 1,
+    sessionId: `${started.sessionId}-stale`
+  });
+  assert.equal(mismatched.ok, false);
+});
+
+test("a session with diagnostics disabled refuses an export snapshot", async () => {
+  const harness = await createHarness({
+    sendMessage(message) {
+      if (
+        message.type === "START_PLAYBACK_SESSION" ||
+        message.type === "GET_RUNTIME_CONFIG"
+      ) {
+        return Promise.resolve({
+          ok: true,
+          sessionId: message.sessionId,
+          config: {
+            playbackSessionId: message.sessionId,
+            settings: {
+              globalEnabled: true,
+              diagnostics: { enabled: false },
+              privacy: {
+                cosmeticFiltering: false,
+                urlCleaning: false
+              }
+            },
+            cosmeticSelectors: []
+          }
+        });
+      }
+      return Promise.resolve({ ok: true });
+    }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const started = harness.messages.find(
+    (message) => message.type === "START_PLAYBACK_SESSION"
+  );
+  const snapshot = await harness.requestRuntimeMessage({
+    type: "CAPTURE_DIAGNOSTIC_SNAPSHOT",
+    version: 1,
+    sessionId: started.sessionId
+  });
+
+  assert.equal(snapshot.ok, false);
+  assert.match(snapshot.error, /not active/i);
+});
 test("page-context probes use one bounded Range stream for a registered route", async () => {
   const sample = new Uint8Array(262_144).fill(0x5a);
   const fetchCalls = [];

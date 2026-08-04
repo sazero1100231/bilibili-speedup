@@ -95,3 +95,40 @@ test("probe scheduler rejects work beyond the per-tab byte budget", async () => 
     /byte budget exceeded/i
   );
 });
+
+test("recovery can use only its bounded reserve after discovery exhausts the base budget", async () => {
+  const scheduler = new ProbeScheduler();
+  const base = PROBE_SCHEDULER_LIMITS.perTabBytesPerMinute;
+  const reserve =
+    PROBE_SCHEDULER_LIMITS.perTabRecoveryReserveBytesPerMinute;
+  await scheduler.schedule({
+    tabId: 4,
+    estimatedBytes: base,
+    run: async () => ({ value: true, bytes: base })
+  });
+
+  await assert.rejects(
+    scheduler.schedule({
+      tabId: 4,
+      estimatedBytes: 1,
+      run: async () => true
+    }),
+    /byte budget exceeded/i
+  );
+  await scheduler.schedule({
+    tabId: 4,
+    estimatedBytes: reserve,
+    recovery: true,
+    run: async () => ({ value: true, bytes: reserve })
+  });
+  assert.equal(scheduler.snapshot().bytesByTab[4], base + reserve);
+  await assert.rejects(
+    scheduler.schedule({
+      tabId: 4,
+      estimatedBytes: 1,
+      recovery: true,
+      run: async () => true
+    }),
+    /byte budget exceeded/i
+  );
+});

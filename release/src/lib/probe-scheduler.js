@@ -3,6 +3,11 @@ export const PROBE_SCHEDULER_LIMITS = Object.freeze({
   perTabConcurrency: 1,
   globalBytesPerMinute: 8 * 1024 * 1024,
   perTabBytesPerMinute: 2 * 1024 * 1024,
+  // Ordinary discovery stays inside the base budgets. Recovery may borrow
+  // one complete three-sample probe per tab so a previous presentation
+  // cannot consume the only capacity available when playback actually fails.
+  globalRecoveryReserveBytesPerMinute: 4 * 3 * 256 * 1024,
+  perTabRecoveryReserveBytesPerMinute: 3 * 256 * 1024,
   windowMs: 60_000
 });
 
@@ -29,7 +34,7 @@ export class ProbeScheduler {
     this.nextId = 1;
   }
 
-  schedule({ tabId, estimatedBytes, run }) {
+  schedule({ tabId, estimatedBytes, recovery = false, run }) {
     if (!Number.isInteger(tabId) || tabId < 0 || typeof run !== "function") {
       return Promise.reject(new Error("Invalid probe scheduling input"));
     }
@@ -40,6 +45,7 @@ export class ProbeScheduler {
         id: this.nextId++,
         tabId,
         estimatedBytes: reservation,
+        recovery: recovery === true,
         run,
         resolve,
         reject
@@ -72,13 +78,21 @@ export class ProbeScheduler {
     return { global, tab };
   }
 
-  canReserve(tabId, bytes) {
+  canReserve(tabId, bytes, recovery = false) {
     const used = this.usedBytes(tabId);
+    const globalLimit =
+      this.limits.globalBytesPerMinute +
+      (recovery
+        ? this.limits.globalRecoveryReserveBytesPerMinute
+        : 0);
+    const tabLimit =
+      this.limits.perTabBytesPerMinute +
+      (recovery
+        ? this.limits.perTabRecoveryReserveBytesPerMinute
+        : 0);
     return (
-      used.global + this.reservedGlobal + bytes <=
-        this.limits.globalBytesPerMinute &&
-      used.tab + (this.reservedByTab.get(tabId) ?? 0) + bytes <=
-        this.limits.perTabBytesPerMinute
+      used.global + this.reservedGlobal + bytes <= globalLimit &&
+      used.tab + (this.reservedByTab.get(tabId) ?? 0) + bytes <= tabLimit
     );
   }
 
@@ -131,7 +145,13 @@ export class ProbeScheduler {
         continue;
       }
       const task = queue[0];
-      if (!this.canReserve(tabId, task.estimatedBytes)) {
+      if (
+        !this.canReserve(
+          tabId,
+          task.estimatedBytes,
+          task.recovery
+        )
+      ) {
         queue.shift();
         task.reject(new Error("Probe byte budget exceeded"));
         checked -= 1;

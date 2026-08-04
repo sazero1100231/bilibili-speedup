@@ -7,6 +7,7 @@ import {
   healthyHosts
 } from "../../src/lib/cdn-selection.js";
 import {
+  PROBE_POLICY_VERSION,
   normalizeRuntimeState,
   normalizeSettings
 } from "../../src/lib/defaults.js";
@@ -26,6 +27,7 @@ test("auto strategy accepts only fresh healthy probe results", () => {
   const now = Date.now();
   const settings = normalizeSettings();
   const runtime = normalizeRuntimeState({
+    probePolicyVersion: PROBE_POLICY_VERSION,
     selectedHost: pool.preferred[0].host,
     rankedHosts: [pool.preferred[0].host, pool.preferred[1].host],
     probeCache: {
@@ -50,6 +52,30 @@ test("auto strategy accepts only fresh healthy probe results", () => {
   );
 });
 
+test("same-millisecond failed route evidence cannot hide a healthy route", () => {
+  const now = Date.now();
+  const host = pool.preferred[0].host;
+  const settings = normalizeSettings();
+  const runtime = normalizeRuntimeState({
+    probePolicyVersion: PROBE_POLICY_VERSION,
+    selectedHost: host,
+    rankedHosts: [host],
+    probeCache: {
+      "route-a": {
+        host,
+        healthy: false,
+        measuredAt: now
+      },
+      "route-b": {
+        host,
+        healthy: true,
+        measuredAt: now
+      }
+    }
+  });
+  assert.deepEqual(freshHealthyHosts(settings, runtime, pool, now), [host]);
+  assert.equal(chooseSelectedHost(settings, runtime, pool, now), host);
+});
 test("candidate pool entries outside the Bilibili media surface are discarded", () => {
   const now = Date.now();
   const settings = normalizeSettings();
@@ -58,6 +84,7 @@ test("candidate pool entries outside the Bilibili media surface are discarded", 
     conditional: pool.conditional
   };
   const runtime = normalizeRuntimeState({
+    probePolicyVersion: PROBE_POLICY_VERSION,
     rankedHosts: ["evil.example.com", pool.preferred[0].host],
     probeCache: {
       "evil.example.com": {

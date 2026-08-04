@@ -40,7 +40,7 @@ if (typeof WebSocket !== "function") {
   throw new Error("Node.js 22+ with the global WebSocket API is required.");
 }
 
-const profile = mkdtempSync(path.join(tmpdir(), "bili-oversea-e2e-"));
+const profile = mkdtempSync(path.join(tmpdir(), "bilibili-speedup-e2e-"));
 const stderr = [];
 let browser;
 let browserCdp;
@@ -608,13 +608,15 @@ try {
   ]);
   console.log("[e2e] extension rules and content scripts ready");
   assert.deepEqual(initialState.scripts, [
-    "bili-oversea-bridge",
-    "bili-oversea-main"
+    "bilibili-speedup-bridge",
+    "bilibili-speedup-main"
   ]);
+  assert.equal(initialState.settings.diagnostics.enabled, false);
   await workerCdp.evaluate(`(async () => {
     const { settings } = await chrome.storage.local.get("settings");
     settings.acceleration.strategy = "manual";
     settings.acceleration.manualHost = "upos-sz-mirrorcos.bilivideo.com";
+    settings.diagnostics.enabled = true;
     await chrome.storage.local.set({ settings });
     return true;
   })()`);
@@ -1071,7 +1073,7 @@ try {
   if (localServer) {
     await new Promise((resolve) => localServer.close(resolve));
   }
-  const expectedPrefix = path.join(tmpdir(), "bili-oversea-e2e-");
+  const expectedPrefix = path.join(tmpdir(), "bilibili-speedup-e2e-");
   if (profile.startsWith(expectedPrefix)) {
     try {
       rmSync(profile, {

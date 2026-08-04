@@ -1,0 +1,36 @@
+{
+  "list_version": "2026.07.16-1",
+  "last_reviewed": "2026-07-16",
+  "selectors": [
+    {
+      "selector": ".bili-video-card:has([data-ad-report])",
+      "scope": "首頁資訊流",
+      "rationale": "隱藏帶明確廣告回報屬性的視頻卡片，避免以文字關鍵字誤傷正常內容。"
+    },
+    {
+      "selector": ".feed-card:has([data-ad-report])",
+      "scope": "首頁資訊流",
+      "rationale": "隱藏新版資訊流中帶明確廣告回報屬性的卡片。"
+    },
+    {
+      "selector": "[data-ad-report][class*=\"card\"]",
+      "scope": "資訊流",
+      "rationale": "涵蓋帶廣告回報資料且語意為卡片的推廣元素。"
+    },
+    {
+      "selector": ".ad-floor-exp",
+      "scope": "首頁／分區頁",
+      "rationale": "Bilibili 廣告樓層容器的明確類名。"
+    },
+    {
+      "selector": ".video-page-special-card:has([data-ad-report])",
+      "scope": "視頻頁右側",
+      "rationale": "只隱藏帶廣告回報屬性的右側特殊活動卡，保留一般推薦卡。"
+    },
+    {
+      "selector": ".bpx-player-cmd-dm-inside:has([data-ad-report])",
+      "scope": "播放器",
+      "rationale": "隱藏播放器內帶廣告回報屬性的活動掛件。"
+    }
+  ]
+}

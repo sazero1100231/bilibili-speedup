@@ -4,9 +4,9 @@ dist/
 .vscode/
 debug_*/
 debug_log/
-bili-oversea-accel-*.json
-bilibili-speedup-*.json
+/*-20??-??-??T??-??-??-???Z.json
 verification/
+/bilibili-speedup-v*-review/
 *.log
 *.har
 *.crx

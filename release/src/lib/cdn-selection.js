@@ -9,6 +9,20 @@ export function candidateHosts(cdnPool) {
   ]).filter(isAllowedMediaHostname);
 }
 
+function latestHealthyProbeForHost(runtime, host) {
+  let latest = null;
+  for (const result of Object.values(runtime?.probeCache ?? {})) {
+    if (
+      result?.host === host &&
+      result.healthy &&
+      (!latest || Number(result.measuredAt) >= Number(latest.measuredAt))
+    ) {
+      latest = result;
+    }
+  }
+  return latest;
+}
+
 export function freshHealthyHosts(
   settings,
   runtime,
@@ -18,7 +32,7 @@ export function freshHealthyHosts(
   const candidates = new Set(candidateHosts(cdnPool));
   const maxAgeMs = settings.acceleration.probeCacheMinutes * 60 * 1000;
   return uniqueStrings(runtime.rankedHosts).filter((host) => {
-    const result = runtime.probeCache[host];
+    const result = latestHealthyProbeForHost(runtime, host);
     return Boolean(
       candidates.has(host) &&
         result?.healthy &&

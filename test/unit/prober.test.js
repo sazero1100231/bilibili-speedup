@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  MIN_RELIABLE_PROBE_TRANSFER_MS,
   PROBE_BYTES,
   probeHost,
   probeMediaPath
@@ -83,12 +84,77 @@ test("probeHost treats a zero-resolution page body interval conservatively", asy
   });
 
   assert.equal(result.transferDurationMs, 0);
+  assert.equal(result.bodyTimingReliable, false);
+  assert.equal(result.throughputDurationMs, 264);
   assert.equal(
     result.throughputBps,
     Math.round((PROBE_BYTES * 8 * 1000) / 264)
   );
+  assert.equal(result.requestThroughputBps, result.throughputBps);
 });
 
+test("probeHost treats a quantized one-millisecond body interval conservatively", async () => {
+  const response = new Response(new Uint8Array(PROBE_BYTES), {
+    status: 206
+  });
+  Object.defineProperty(response, "probeTiming", {
+    value: {
+      ttfbMs: 309,
+      transferDurationMs: 1,
+      durationMs: 310
+    }
+  });
+  const result = await probeHost({
+    mediaUrl,
+    host: "candidate.bilivideo.com",
+    fetchImpl: async () => response
+  });
+
+  assert.equal(result.transferDurationMs, 1);
+  assert.equal(result.bodyTimingReliable, false);
+  assert.equal(result.throughputDurationMs, 310);
+  assert.equal(
+    result.throughputBps,
+    Math.round((PROBE_BYTES * 8 * 1000) / 310)
+  );
+  assert.equal(result.requestThroughputBps, result.throughputBps);
+  assert.ok(result.throughputBps < 10_000_000);
+});
+
+test("probeHost accepts the explicit reliable-body timing boundary", async () => {
+  const response = new Response(new Uint8Array(PROBE_BYTES), {
+    status: 206
+  });
+  Object.defineProperty(response, "probeTiming", {
+    value: {
+      ttfbMs: 95,
+      transferDurationMs: MIN_RELIABLE_PROBE_TRANSFER_MS,
+      durationMs: 100
+    }
+  });
+  const result = await probeHost({
+    mediaUrl,
+    host: "candidate.bilivideo.com",
+    fetchImpl: async () => response
+  });
+
+  assert.equal(result.bodyTimingReliable, true);
+  assert.equal(
+    result.throughputDurationMs,
+    MIN_RELIABLE_PROBE_TRANSFER_MS
+  );
+  assert.equal(
+    result.throughputBps,
+    Math.round(
+      (PROBE_BYTES * 8 * 1000) /
+        MIN_RELIABLE_PROBE_TRANSFER_MS
+    )
+  );
+  assert.equal(
+    result.requestThroughputBps,
+    Math.round((PROBE_BYTES * 8 * 1000) / 100)
+  );
+});
 test("probeHost rejects inconsistent page timing and measures locally", async () => {
   const response = new Response(new Uint8Array(PROBE_BYTES), {
     status: 206

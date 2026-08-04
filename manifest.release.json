@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Bilibili 海外播放加速與追蹤淨化",
   "short_name": "Bili 海外加速",
-  "version": "1.1.17",
+  "version": "1.1.21",
   "description": "以本地 CDN 節點評估、playurl 改寫與追蹤淨化改善 Bilibili 海外播放體驗。",
   "permissions": [
     "declarativeNetRequest",
