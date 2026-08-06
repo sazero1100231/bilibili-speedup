@@ -989,6 +989,88 @@ test("recovery reuses only the exact session route reference after its registere
   }
 });
 
+test("recovery may re-read its quarantined exact URL when no byte-zero reference exists", async () => {
+  const tabId = 411;
+  const sessionId = "session-recovery-fallback-reference";
+  const presentationId = "bvid-BVRECOVERYFALLBACK";
+  const routeKey = "/path/recovery-fallback-reference.m4s";
+  const referenceUrl =
+    "https://upos-hz-mirrorakam.akamaized.net/path/recovery-fallback-reference.m4s?hdnts=official";
+  const sample = new Uint8Array(262_144).fill(43);
+  await send(
+    {
+      type: "START_PLAYBACK_SESSION",
+      sessionId,
+      sessionEpoch: 1,
+      pageUrl: "https://www.bilibili.com/video/BVRECOVERYFALLBACK"
+    },
+    tabId
+  );
+  await send(
+    {
+      type: "REGISTER_MEDIA_ROUTES",
+      sessionId,
+      routes: [
+        {
+          presentationId,
+          routeKey,
+          urls: [referenceUrl],
+          kind: "video",
+          bandwidth: 1_000_000
+        }
+      ]
+    },
+    tabId
+  );
+  await send(
+    {
+      type: "HOST_DEGRADED",
+      sessionId,
+      presentationId,
+      routeKey,
+      host: "upos-hz-mirrorakam.akamaized.net",
+      reason: "timeout"
+    },
+    tabId
+  );
+
+  const requestedHosts = [];
+  globalThis.fetch = async (url) => {
+    requestedHosts.push(new URL(url).hostname);
+    return new Response(sample, { status: 206 });
+  };
+  try {
+    const recovery = await send(
+      {
+        type: "PROBE_MEDIA",
+        sessionId,
+        presentationId,
+        routeKey,
+        mediaUrl: referenceUrl,
+        recovery: true
+      },
+      tabId
+    );
+    assert.equal(requestedHosts[0], "upos-hz-mirrorakam.akamaized.net");
+    assert.equal(recovery.probeOutcome.attemptedPoolCandidates, 2);
+    assert.equal(recovery.probeOutcome.qualifiedCandidates, 2);
+    assert.equal(requestedHosts.length, 3);
+    assert.equal(
+      requestedHosts.slice(1).includes("upos-hz-mirrorakam.akamaized.net"),
+      false
+    );
+    assert.equal(
+      recovery.config.compatibleRoutes[`${presentationId}::${routeKey}`]
+        .length,
+      2
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    await send({ type: "CLEAR_PROBE_CACHE" }, tabId);
+    tabRemovedListener(tabId);
+  }
+});
+
 test("observed exact-route evidence survives scheduler rejection for a later recovery", async () => {
   const tabId = 312;
   const sessionId = "session-budgeted-reference";
@@ -2047,6 +2129,96 @@ test("a statically blocked native escape cannot close through recovery", async (
     () => !sessionRules.some((rule) => rule.condition.tabIds?.includes(tabId)),
     "static-recovery tab cleanup"
   );
+});
+
+test("a qualified alternate atomically restores a finite native bypass", async () => {
+  const tabId = 412;
+  const sessionId = "session-finite-bypass-restore";
+  const presentationId = "bvid-BVRESTOREBYPASS";
+  const routeKey = "/path/restore-bypass.m4s";
+  const blockedUrl =
+    "https://upos-sz-mirrorcosov.bilivideo.com/path/restore-bypass.m4s?token=source";
+  const safeUrl =
+    "https://upos-hz-mirrorakam.akamaized.net/path/restore-bypass.m4s?token=backup";
+  await send(
+    {
+      type: "START_PLAYBACK_SESSION",
+      sessionId,
+      sessionEpoch: 1,
+      pageUrl: "https://www.bilibili.com/video/BVRESTOREBYPASS"
+    },
+    tabId
+  );
+  await send(
+    {
+      type: "REGISTER_MEDIA_ROUTES",
+      sessionId,
+      routes: [
+        {
+          presentationId,
+          routeKey,
+          urls: [blockedUrl, safeUrl],
+          kind: "video"
+        }
+      ]
+    },
+    tabId
+  );
+  const bypass = await send(
+    {
+      type: "BYPASS_PLAYBACK_ROUTE",
+      sessionId,
+      presentationId,
+      routeKey,
+      until: Date.now() + 30_000
+    },
+    tabId
+  );
+  assert.equal(bypass.ruleCount, 0);
+
+  const restored = await send(
+    {
+      type: "RESTORE_PLAYBACK_ROUTE",
+      sessionId,
+      presentationId,
+      routeKey
+    },
+    tabId
+  );
+  assert.equal(restored.restored, true);
+  assert.equal(restored.persistent, false);
+  assert.equal(restored.ruleCount, 1);
+  assert.ok(
+    sessionRules.some(
+      (rule) =>
+        rule.condition.tabIds?.includes(tabId) &&
+        rule.action.redirect.url === safeUrl
+    )
+  );
+
+  await send(
+    {
+      type: "BYPASS_PLAYBACK_ROUTE",
+      sessionId,
+      presentationId,
+      routeKey,
+      persistent: true
+    },
+    tabId
+  );
+  const persistent = await send(
+    {
+      type: "RESTORE_PLAYBACK_ROUTE",
+      sessionId,
+      presentationId,
+      routeKey
+    },
+    tabId
+  );
+  assert.equal(persistent.restored, false);
+  assert.equal(persistent.persistent, true);
+  assert.equal(persistent.ruleCount, 0);
+  tabRemovedListener(tabId);
 });
 
 test("an exhausted exact route removes its DNR redirects during native bypass", async () => {

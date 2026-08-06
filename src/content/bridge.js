@@ -26,6 +26,7 @@
     "handoff-triggered",
     "media-degraded",
     "playback-risk",
+    "probe-recovery-error",
     "probe-recovery-exhausted",
     "route-policy",
     "route-policy-error",
@@ -64,6 +65,8 @@
   const recoveryProbeBackoffs = new Map();
   const recoveryTriggerBackoffs = new Map();
   const recoveryProbeRetryTimers = new Map();
+  const temporaryBypassRequests = new Map();
+  const routeRestoreRequests = new Map();
   const recoveryTimers = new Map();
   const activePageProbes = new Map();
   const pendingDiagnosticSessions = new Map();
@@ -1253,12 +1256,12 @@
     const routeKey = normalizedRouteKey(payload.routeKey);
     const routeId = routeDetailId({ presentationId, routeKey });
     if (!routeId) {
-      return;
+      return Promise.resolve(null);
     }
     const now = Date.now();
     const existingUntil = recoveryProbeBackoffs.get(routeId) ?? 0;
     if (!force && existingUntil > now) {
-      return;
+      return temporaryBypassRequests.get(routeId) ?? Promise.resolve(null);
     }
     const until = Math.max(
       now + RECOVERY_PROBE_BACKOFF_MS,
@@ -1278,7 +1281,7 @@
       until
     });
     const requestSessionId = session.id;
-    void chrome.runtime
+    const request = chrome.runtime
       .sendMessage({
         type: "BYPASS_PLAYBACK_ROUTE",
         sessionId: requestSessionId,
@@ -1309,7 +1312,94 @@
         );
         recordSession();
       })
-      .catch(() => {});
+      .catch(() => null)
+      .finally(() => {
+        if (temporaryBypassRequests.get(routeId) === request) {
+          temporaryBypassRequests.delete(routeId);
+        }
+      });
+    temporaryBypassRequests.set(routeId, request);
+    return request;
+  }
+
+  function restoreNativeRouteBypass(payload) {
+    const presentationId = normalizedPresentationId(payload.presentationId);
+    const kind = normalizedKind(payload.kind);
+    const routeKey = normalizedRouteKey(payload.routeKey);
+    const routeId = routeDetailId({ presentationId, routeKey });
+    if (!routeId) {
+      return Promise.resolve(null);
+    }
+    const existing = routeRestoreRequests.get(routeId);
+    if (existing) {
+      return existing;
+    }
+    const requestSessionId = session.id;
+    const request = Promise.resolve(temporaryBypassRequests.get(routeId))
+      .catch(() => null)
+      .then(() => chrome.runtime.sendMessage({
+        type: "RESTORE_PLAYBACK_ROUTE",
+        sessionId: requestSessionId,
+        ...(Number.isInteger(routingTabId) ? { routingTabId } : {}),
+        presentationId,
+        routeKey
+      }))
+      .then((response) => {
+        if (
+          !response?.ok ||
+          requestSessionId !== session.id ||
+          response.sessionId !== requestSessionId ||
+          response.presentationId !== presentationId ||
+          response.routeKey !== routeKey
+        ) {
+          return response;
+        }
+        session.activeRuleCount = Math.max(
+          0,
+          Number(response.ruleCount) || 0
+        );
+        applyResourceStats(response.resourceStats);
+        if (response.config) {
+          dispatchConfig(response.config);
+        }
+        if (response.persistent !== true) {
+          recoveryProbeBackoffs.delete(routeId);
+          sendToMain("ROUTE_NATIVE_BYPASS_CLEAR", {
+            presentationId,
+            kind,
+            routeKey
+          });
+          if (response.restored === true) {
+            addEvent(
+              "route-native-restored",
+              String(payload.host ?? "").slice(0, 255),
+              `${presentationId} ${kind} ${routeKey}; qualified alternate`
+            );
+            recordSession();
+          }
+        }
+        return response;
+      })
+      .catch((error) => {
+        if (requestSessionId === session.id) {
+          addEvent(
+            "probe-recovery-error",
+            String(payload.host ?? "").slice(0, 255),
+            `${presentationId} ${kind} ${routeKey}; restore failed; ${String(
+              error?.message ?? error
+            ).slice(0, 140)}`
+          );
+          recordSession();
+        }
+        return null;
+      })
+      .finally(() => {
+        if (routeRestoreRequests.get(routeId) === request) {
+          routeRestoreRequests.delete(routeId);
+        }
+      });
+    routeRestoreRequests.set(routeId, request);
+    return request;
   }
 
   function requestRecoveryProbe(payload) {
@@ -1592,6 +1682,9 @@
     let recoveryRetryReason = "probe-budget";
     let nextRecoveryCandidatesAttempted = recoveryCandidatesAttempted;
     let nextRecoveryUnderpoweredSeen = recoveryUnderpoweredSeen;
+    const recoveryHasTemporaryBypass = () =>
+      temporaryBypassRequests.has(routeId) ||
+      (recoveryProbeBackoffs.get(routeId) ?? 0) > Date.now();
     chrome.runtime
       .sendMessage({
         type: "PROBE_MEDIA",
@@ -1654,6 +1747,14 @@
               presentationId,
               mediaRouteKey
             );
+            if (compatible) {
+              void restoreNativeRouteBypass({
+                presentationId,
+                kind,
+                routeKey: mediaRouteKey,
+                host: mediaHost
+              });
+            }
             const poolExhausted =
               response.probeOutcome.poolExhausted === true ||
               (
@@ -1661,6 +1762,20 @@
                 nextRecoveryCandidatesAttempted >= candidatePoolSize
               );
             if (!compatible) {
+              if (
+                attemptedPoolCandidates === 0 &&
+                candidatePoolSize > 0 &&
+                recoveryHasTemporaryBypass()
+              ) {
+                retryRecoveryLater = true;
+                recoveryRetryReason = "reference-unavailable";
+                addEvent(
+                  "probe-recovery-error",
+                  mediaHost,
+                  `${presentationId} ${kind} ${mediaRouteKey}; reference unavailable; retry scheduled`
+                );
+                recordSession();
+              }
               exhaustRecovery = poolExhausted;
               continueRecovery =
                 !poolExhausted &&
@@ -1734,11 +1849,39 @@
             });
         } else if (requestSessionId === session.id) {
           releaseQualification();
+          if (recovery) {
+            if (recoveryHasTemporaryBypass()) {
+              retryRecoveryLater = true;
+              recoveryRetryReason = "probe-error";
+            }
+            addEvent(
+              "probe-recovery-error",
+              mediaHost,
+              `${presentationId} ${kind} ${mediaRouteKey}; ${String(
+                response?.error ?? "unknown probe error"
+              ).slice(0, 160)}`
+            );
+            recordSession();
+          }
         }
       })
-      .catch(() => {
+      .catch((error) => {
         if (requestSessionId === session.id) {
           releaseQualification();
+          if (recovery) {
+            if (recoveryHasTemporaryBypass()) {
+              retryRecoveryLater = true;
+              recoveryRetryReason = "probe-error";
+            }
+            addEvent(
+              "probe-recovery-error",
+              mediaHost,
+              `${presentationId} ${kind} ${mediaRouteKey}; ${String(
+                error?.message ?? error
+              ).slice(0, 160)}`
+            );
+            recordSession();
+          }
         }
       })
       .finally(() => {
@@ -2102,6 +2245,8 @@
       clearTimeout(timer);
     }
     recoveryProbeRetryTimers.clear();
+    temporaryBypassRequests.clear();
+    routeRestoreRequests.clear();
     // Probe limits are scoped to one SPA navigation session, not the tab lifetime.
     probedKeys.clear();
     probeCountsByPresentation.clear();
@@ -2481,6 +2626,8 @@
       clearTimeout(timer);
     }
     recoveryProbeRetryTimers.clear();
+    temporaryBypassRequests.clear();
+    routeRestoreRequests.clear();
     probedKeys.clear();
     probeCountsByPresentation.clear();
     probeReferenceKeys.clear();

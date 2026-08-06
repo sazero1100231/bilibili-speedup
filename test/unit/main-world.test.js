@@ -1643,6 +1643,56 @@ test("an exhausted route bypasses rewrite, probing, fallback, and XHR monitoring
   }
 });
 
+test("a qualified alternate clears a finite native bypass but not a persistent one", async () => {
+  const bvid = "BV1234567890";
+  const presentationId = `bvid-${bvid}`;
+  const routeKey = new URL(originalMedia).pathname;
+  const harness = await createHarness(playurlPayload(), {
+    pageUrl: `https://www.bilibili.com/video/${bvid}`
+  });
+  await harness.setConfig(config(true));
+  await harness.window
+    .fetch(`https://api.bilibili.com/x/player/wbi/playurl?bvid=${bvid}`)
+    .then((response) => response.json());
+
+  harness.sendPrivate("ROUTE_NATIVE_BYPASS", {
+    presentationId,
+    routeKey,
+    until: Date.now() + 30_000
+  });
+  const bypassed = await harness.window
+    .fetch(`https://api.bilibili.com/x/player/wbi/playurl?bvid=${bvid}`)
+    .then((response) => response.json());
+  assert.equal(bypassed.data.dash.video[0].baseUrl, originalMedia);
+
+  harness.sendPrivate("ROUTE_NATIVE_BYPASS_CLEAR", {
+    presentationId,
+    routeKey
+  });
+  const restored = await harness.window
+    .fetch(`https://api.bilibili.com/x/player/wbi/playurl?bvid=${bvid}`)
+    .then((response) => response.json());
+  assert.notEqual(restored.data.dash.video[0].baseUrl, originalMedia);
+  assert.equal(
+    new URL(restored.data.dash.video[0].baseUrl).hostname,
+    "upos-sz-mirrorcos.bilivideo.com"
+  );
+
+  harness.sendPrivate("ROUTE_NATIVE_BYPASS", {
+    presentationId,
+    routeKey,
+    persistent: true
+  });
+  harness.sendPrivate("ROUTE_NATIVE_BYPASS_CLEAR", {
+    presentationId,
+    routeKey
+  });
+  const stillBypassed = await harness.window
+    .fetch(`https://api.bilibili.com/x/player/wbi/playurl?bvid=${bvid}`)
+    .then((response) => response.json());
+  assert.equal(stillBypassed.data.dash.video[0].baseUrl, originalMedia);
+});
+
 test("disabling acceleration during a fetch fallback stops later route-state writes", async () => {
   let resolveMedia;
   const payload = playurlPayload();
