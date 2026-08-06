@@ -566,6 +566,135 @@ test("media degradation never starts a competing recovery probe sweep", async ()
   assert.equal(harness.probeMessages().length, 0);
 });
 
+test("a qualified recovery route restores the temporary native bypass", async () => {
+  const presentationId = "bvid-BV1234567890";
+  const routeKey = "/path/recovery-restore.m4s";
+  const routeId = `${presentationId}::${routeKey}`;
+  const mediaUrl =
+    "https://upos-hz-mirrorakam.akamaized.net/path/recovery-restore.m4s?token=1";
+  const alternateUrl =
+    "https://upos-sz-upcdnbda2.bilivideo.com/path/recovery-restore.m4s?token=1";
+  const runtimeConfig = (sessionId, compatible = false) => ({
+    playbackSessionId: sessionId,
+    settings: {
+      globalEnabled: true,
+      acceleration: { enabled: true },
+      diagnostics: { enabled: true },
+      privacy: { cosmeticFiltering: false, urlCleaning: false }
+    },
+    cosmeticSelectors: [],
+    compatibleRoutes: { [routeId]: compatible ? [alternateUrl] : [] }
+  });
+  const harness = await createHarness({
+    pageUrl: "https://www.bilibili.com/video/BV1234567890",
+    sendMessage(message) {
+      if (
+        message.type === "START_PLAYBACK_SESSION" ||
+        message.type === "GET_RUNTIME_CONFIG"
+      ) {
+        return Promise.resolve({
+          ok: true,
+          sessionId: message.sessionId,
+          routingTabId: 7,
+          config: runtimeConfig(message.sessionId)
+        });
+      }
+      if (message.type === "PROBE_MEDIA") {
+        return Promise.resolve({
+          ok: true,
+          sessionId: message.sessionId,
+          config: runtimeConfig(message.sessionId, true),
+          probeOutcome: {
+            attemptedPoolCandidates: 2,
+            qualifiedCandidates: 1,
+            coveredPoolCandidates: 2,
+            candidatePoolSize: 8,
+            poolExhausted: false
+          }
+        });
+      }
+      if (message.type === "BYPASS_PLAYBACK_ROUTE") {
+        return Promise.resolve({
+          ok: true,
+          sessionId: message.sessionId,
+          presentationId,
+          routeKey,
+          persistent: false,
+          ruleCount: 0,
+          config: runtimeConfig(message.sessionId)
+        });
+      }
+      if (message.type === "RESTORE_PLAYBACK_ROUTE") {
+        return Promise.resolve({
+          ok: true,
+          sessionId: message.sessionId,
+          presentationId,
+          routeKey,
+          restored: true,
+          persistent: false,
+          ruleCount: 1,
+          config: runtimeConfig(message.sessionId, true)
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        sessionId: message.sessionId,
+        ruleCount: 1,
+        escalated: message.type === "HOST_DEGRADED",
+        exhausted: message.type === "HOST_DEGRADED"
+      });
+    }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  harness.emitMainMessage("ROUTE_MANIFEST", {
+    routes: [
+      {
+        presentationId,
+        routeKey,
+        kind: "video",
+        urls: [mediaUrl]
+      }
+    ]
+  });
+  harness.emitMainMessage("MEDIA_DEGRADED", {
+    presentationId,
+    routeKey,
+    kind: "video",
+    host: "upos-hz-mirrorakam.akamaized.net",
+    reason: "timeout",
+    throughputBps: 0,
+    bufferAhead: 0
+  });
+  for (let index = 0; index < 6; index += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  const bypassIndex = harness.messages.findIndex(
+    (message) => message.type === "BYPASS_PLAYBACK_ROUTE"
+  );
+  const restoreIndex = harness.messages.findIndex(
+    (message) => message.type === "RESTORE_PLAYBACK_ROUTE"
+  );
+  assert.ok(bypassIndex >= 0);
+  assert.ok(restoreIndex > bypassIndex);
+  assert.ok(
+    harness.mainMessages.some(
+      (message) =>
+        message.type === "ROUTE_NATIVE_BYPASS_CLEAR" &&
+        message.payload.presentationId === presentationId &&
+        message.payload.routeKey === routeKey
+    )
+  );
+  assert.equal(
+    harness.messages.some(
+      (message) =>
+        message.type === "BYPASS_PLAYBACK_ROUTE" &&
+        message.persistent === true
+    ),
+    false
+  );
+});
+
 test("an underpowered recovery sweep persists exact-route bypass without a probe storm", async () => {
   const presentationId = "bvid-BV1234567890";
   const routeKey = "/path/sweep.m4s";

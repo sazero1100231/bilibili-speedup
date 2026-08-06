@@ -1644,17 +1644,28 @@ async function performProbe(
   // A route may have been captured before the latest blocked-host policy was
   // applied. Never spend the bounded reference probe on that stale first URL
   // when the same registered representation has an unblocked exact backup.
+  const registeredReferenceUrls = uniqueStrings([
+    mediaUrl,
+    ...registeredRoute.urls
+  ]);
+  const unblockedReferenceUrl = registeredReferenceUrls.find((url) => {
+    const host = getHostname(url);
+    return (
+      !currentlyBlockedHosts.has(host) &&
+      !hostnameMatches(host, blockedPatterns)
+    );
+  });
   const referenceUrl = referenceEvidence
     ? mediaUrl
-    : uniqueStrings([mediaUrl, ...registeredRoute.urls]).find(
-        (url) => {
-          const host = getHostname(url);
-          return (
-            !currentlyBlockedHosts.has(host) &&
-            !hostnameMatches(host, blockedPatterns)
-          );
-        }
-      );
+    : unblockedReferenceUrl ?? (
+      recovery
+        // A hard failure can quarantine the route's only registered host
+        // before byte-zero evidence exists. Recovery is still allowed one
+        // bounded 256 KiB/3 s read from that exact signed page URL; without
+        // it no alternate CDN can ever pass the content-identity gate.
+        ? registeredReferenceUrls[0]
+        : ""
+    );
   if (!referenceUrl) {
     throw new Error("No unblocked page probe reference is available");
   }
@@ -2106,6 +2117,58 @@ async function bypassPlaybackRoute(message, sender) {
     routeKey: route.routeKey,
     persistent,
     bypassUntil: persistent ? 0 : until,
+    ruleCount,
+    resourceStats: routingResourceStats(tabId),
+    config: await buildRuntimeConfig(null, tabId)
+  };
+}
+
+async function restorePlaybackRoute(message, sender) {
+  const { tabId, session, sessionId } = requirePlaybackSession(message, sender);
+  const presentationId = sanitizePresentationId(message.presentationId);
+  const routeKey = String(message.routeKey ?? "").slice(0, 1000);
+  const route = findSessionRoute(session, presentationId, routeKey);
+  if (!route || route.presentationId !== presentationId) {
+    throw new Error("Rejected playback route restore");
+  }
+  const previousUntil = session.nativeBypassRoutes.get(route.stateKey);
+  if (
+    previousUntil === undefined ||
+    !Number.isFinite(previousUntil)
+  ) {
+    return {
+      sessionId,
+      presentationId: route.presentationId,
+      routeKey: route.routeKey,
+      restored: false,
+      persistent: previousUntil === Number.POSITIVE_INFINITY,
+      ruleCount: session.ruleCount,
+      resourceStats: routingResourceStats(tabId),
+      config: await buildRuntimeConfig(null, tabId)
+    };
+  }
+  const timerKey = nativeBypassTimerKey(
+    tabId,
+    session.sessionId,
+    route.stateKey
+  );
+  clearTimeout(nativeBypassTimers.get(timerKey));
+  nativeBypassTimers.delete(timerKey);
+  session.nativeBypassRoutes.delete(route.stateKey);
+  let ruleCount;
+  try {
+    ruleCount = await replaceTabSessionRules(tabId, session);
+  } catch (error) {
+    session.nativeBypassRoutes.set(route.stateKey, previousUntil);
+    scheduleNativeRouteBypassExpiry(tabId, session, route.stateKey);
+    throw error;
+  }
+  return {
+    sessionId,
+    presentationId: route.presentationId,
+    routeKey: route.routeKey,
+    restored: true,
+    persistent: false,
     ruleCount,
     resourceStats: routingResourceStats(tabId),
     config: await buildRuntimeConfig(null, tabId)
@@ -3165,6 +3228,9 @@ async function handleMessage(message, sender) {
     case "BYPASS_PLAYBACK_ROUTE":
       await requireRoutingEnabled();
       return bypassPlaybackRoute(message, sender);
+    case "RESTORE_PLAYBACK_ROUTE":
+      await requireRoutingEnabled();
+      return restorePlaybackRoute(message, sender);
     case "HOST_RECOVERED":
       await requireRoutingEnabled();
       return recoverPlaybackHost(message, sender);

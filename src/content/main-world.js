@@ -329,6 +329,27 @@
     }
   }
 
+  function clearNativeRouteBypass(payload) {
+    const presentationId = normalizedPresentationId(payload?.presentationId);
+    const routeKey = String(payload?.routeKey ?? "").slice(0, 1000);
+    const identity = routeIdentity(presentationId, routeKey);
+    if (
+      !presentationId ||
+      !routeKey ||
+      !state.mediaRoutes.has(identity)
+    ) {
+      return;
+    }
+    const until = state.nativeBypassRoutes.get(identity);
+    // A capacity-exhausted route uses an explicit session-long bypass. Only
+    // the finite guard installed while recovery is probing may be removed by
+    // a newly qualified alternate host.
+    if (!Number.isFinite(until)) {
+      return;
+    }
+    state.nativeBypassRoutes.delete(identity);
+  }
+
   function hasStablePagePresentation(rawUrl = location.href) {
     const url = parseUrl(rawUrl);
     return Boolean(
@@ -2911,6 +2932,8 @@
           acknowledgePolicyReady(message.payload?.requestId);
         } else if (message.type === "ROUTE_NATIVE_BYPASS") {
           applyNativeRouteBypass(message.payload);
+        } else if (message.type === "ROUTE_NATIVE_BYPASS_CLEAR") {
+          clearNativeRouteBypass(message.payload);
         }
       } catch {
         // Reject malformed private-channel messages.
