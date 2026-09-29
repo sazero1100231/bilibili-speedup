@@ -9,6 +9,7 @@ const inputs = {
 const status = document.querySelector("#status");
 const node = document.querySelector("#node");
 let config;
+let playbackStatus = null;
 
 function render() {
   inputs.globalEnabled.checked = config.settings.globalEnabled;
@@ -20,9 +21,14 @@ function render() {
   inputs.accelerationEnabled.disabled = !enabled;
   inputs.urlCleaning.disabled = !enabled;
   inputs.telemetryBlocking.disabled = !enabled;
-  node.textContent = config.selectedHost
-    ? `Probe-ranked pick: ${config.selectedHost}`
-    : "No verified speedup node yet; with no candidate it keeps Bilibili native routing";
+  const current = playbackStatus?.playback;
+  node.textContent = !config.settings.globalEnabled || !config.settings.acceleration.enabled
+    ? "Playback acceleration is disabled"
+    : current?.status === "seeking" ? "Loading the new playback position"
+    : current?.status === "waiting" ? "Playback is waiting for data; evaluating available routes"
+    : current?.status === "paused" ? "Playback is paused"
+    : current?.status === "playing" ? "Video is playing; adjusting transfers to buffer demand"
+    : "No playback status for this tab yet; a node speed test does not confirm playback recovery";
 }
 
 async function load() {
@@ -33,6 +39,10 @@ async function load() {
     throw new Error(response?.error ?? "Load failed");
   }
   config = response.config;
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (Number.isInteger(tab?.id)) playbackStatus = await chrome.runtime.sendMessage({ type: "GET_TAB_PLAYBACK_STATUS", tabId: tab.id });
+  } catch { playbackStatus = null; }
   render();
 }
 

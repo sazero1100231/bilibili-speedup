@@ -69,6 +69,7 @@
   const routeRestoreRequests = new Map();
   const recoveryTimers = new Map();
   const activePageProbes = new Map();
+  const transferOwners = new Map();
   const pendingDiagnosticSessions = new Map();
   let diagnosticTimer = null;
   let latestRoutes = [];
@@ -82,6 +83,55 @@
     }
     const payload = message.payload ?? {};
     switch (message.type) {
+      case "TRANSFER_ACQUIRE": {
+        const id = String(payload.id || "");
+        if (!/^[\w:-]{1,100}$/.test(id) || transferOwners.size >= 32 || transferOwners.has(id)) break;
+        const owner = { sessionId: session.id, routingTabId, cancelled: false };
+        transferOwners.set(id, owner);
+        void routeRegistrationPromise.then(async () => {
+          if (owner.cancelled || owner.sessionId !== session.id) return { ok: false };
+          return chrome.runtime.sendMessage({ type: "ACQUIRE_TRANSFER", id, kind: payload.kind,
+            sessionId: owner.sessionId, ...(Number.isInteger(owner.routingTabId) ? { routingTabId: owner.routingTabId } : {}) });
+        }).then(response => {
+          if (owner.cancelled || owner.sessionId !== session.id) {
+            void chrome.runtime.sendMessage({ type: "RELEASE_TRANSFER", id, sessionId: owner.sessionId,
+              ...(Number.isInteger(owner.routingTabId) ? { routingTabId: owner.routingTabId } : {}) }).catch(() => {});
+            return;
+          }
+          sendToMain("TRANSFER_GRANTED", { id, ok: Boolean(response?.ok) });
+          if (!response?.ok) transferOwners.delete(id);
+        }).catch(() => { transferOwners.delete(id); sendToMain("TRANSFER_GRANTED", { id, ok: false }); });
+        break;
+      }
+      case "TRANSFER_RELEASE": {
+        const id = String(payload.id || "");
+        const owner = transferOwners.get(id);
+        if (owner) {
+          owner.cancelled = true; transferOwners.delete(id);
+          void chrome.runtime.sendMessage({ type: "RELEASE_TRANSFER", id, sessionId: owner.sessionId,
+            ...(Number.isInteger(owner.routingTabId) ? { routingTabId: owner.routingTabId } : {}) }).catch(() => {});
+        }
+        break;
+      }
+      case "MEDIA_TRANSFER_RESULT": {
+        const hosts = (Array.isArray(payload.hosts) ? payload.hosts : []).slice(0, 8).map(host => String(host).slice(0, 255));
+        const totals = session.transfers ||= {};
+        const add = (key, value) => { totals[key] = Math.min(Number.MAX_SAFE_INTEGER, (totals[key] || 0) + Math.max(0, Number(value) || 0)); };
+        add(payload.outcome === "complete" ? "completed" : payload.outcome === "cancelled" ? "cancelled" : "failed", 1);
+        add("requests", payload.requests); add("hedges", payload.hedges);
+        add("receivedBytes", payload.downloadedBytes);
+        if (payload.outcome === "complete") {
+          add("completedBytes", payload.bytes); add("completedExtraBytes", payload.extraBytes);
+        } else add("unfinishedReceivedBytes", payload.downloadedBytes);
+        totals.peak = Math.max(totals.peak || 0, Number(payload.parallelPeak) || 0);
+        if (payload.kind !== "audio" || payload.outcome !== "complete") addEvent("parallel-range", hosts[0] || "",
+          `${routeEventDetail(payload)}; ${String(payload.outcome || "").slice(0, 20)}; useful ${Number(payload.bytes) || 0}; received ${Number(payload.downloadedBytes) || 0}; requests ${Number(payload.requests) || 0}; hedges ${Number(payload.hedges) || 0}; ${Number(payload.durationMs) || 0}ms; hosts ${hosts.length}; peak ${Number(payload.parallelPeak) || 0}`);
+        void chrome.runtime.sendMessage({ type: "TRANSFER_RESULT", sessionId: session.id,
+          ...(Number.isInteger(routingTabId) ? { routingTabId } : {}), outcome: payload.outcome,
+          hostCount: hosts.length, kind: payload.kind }).catch(() => {});
+        recordSession();
+        break;
+      }
       case "PROBE_URL":
         requestProbe(payload.mediaUrl, payload);
         break;
@@ -1906,7 +1956,11 @@
                 nextRecoveryUnderpoweredSeen
             }, recoveryRetryReason);
           } else if (exhaustRecovery) {
-            const persistent = nextRecoveryUnderpoweredSeen;
+            // Capacity is a transient observation, never a session-long ban.
+            const persistent = false;
+            scheduleRecoveryProbeRetry(mediaUrl, { ...routeMeta, presentationId, kind,
+              routeKey: mediaRouteKey, host: mediaHost, recovery: true,
+              recoveryAttempt: 0, recoveryCandidatesAttempted: 0, recoveryUnderpoweredSeen: false }, "capacity-recheck");
             const now = Date.now();
             const existingBackoff =
               recoveryProbeBackoffs.get(routeId) ?? 0;
@@ -1914,9 +1968,8 @@
               now + RECOVERY_PROBE_BACKOFF_MS,
               Number.isFinite(existingBackoff) ? existingBackoff : 0
             );
-            // A temporary exact-route bypass was installed when recovery
-            // started. Never promote page state to Infinity until the service
-            // worker has atomically committed the matching DNR state.
+            // Exhaustion is temporary evidence. Keep the native bypass bounded
+            // while the next scheduled capacity assessment can rediscover routes.
             recoveryProbeBackoffs.set(routeId, bypassUntil);
             if (!persistent) {
               sendToMain("ROUTE_NATIVE_BYPASS", {
@@ -1958,22 +2011,7 @@
                 if (response.config) {
                   dispatchConfig(response.config);
                 }
-                if (persistent) {
-                  recoveryProbeBackoffs.set(
-                    routeId,
-                    Number.POSITIVE_INFINITY
-                  );
-                  clearTimeout(
-                    recoveryProbeRetryTimers.get(routeId)
-                  );
-                  recoveryProbeRetryTimers.delete(routeId);
-                  sendToMain("ROUTE_NATIVE_BYPASS", {
-                    presentationId,
-                    kind,
-                    routeKey: mediaRouteKey,
-                    persistent: true
-                  });
-                }
+
                 recordSession();
               })
               .catch(() => {});
@@ -2045,6 +2083,9 @@
       waitingCount: 0,
       stalledCount: 0,
       bufferingMs: 0,
+      rebufferMs: 0,
+      startupWaitMs: 0,
+      seekWaitMs: 0,
       playbackSeconds: 0,
       mediaHost: "",
       plannedMediaHost: "",
@@ -2191,10 +2232,10 @@
         videoState.sessionId === pendingSession.id &&
         videoState.bufferingSince !== null
       ) {
-        snapshot.bufferingMs += Math.max(
-          0,
-          now - videoState.bufferingSince
-        );
+        const duration = Math.max(0, now - videoState.bufferingSince);
+        snapshot.bufferingMs += duration;
+        const metric = videoState.bufferingReason === "seek" ? "seekWaitMs" : videoState.bufferingReason === "startup" ? "startupWaitMs" : "rebufferMs";
+        snapshot[metric] = (snapshot[metric] || 0) + duration;
       }
     }
     return snapshot;
@@ -2387,8 +2428,7 @@
     const bufferAhead = videoBufferAhead(video);
     const readyState = Math.max(0, Number(video.readyState) || 0);
     if (
-      bufferAhead > NETWORK_RISK_MAX_BUFFER_AHEAD_SECONDS ||
-      readyState >= 3
+      bufferAhead / Math.max(0.25, Number(video.playbackRate) || 1) > NETWORK_RISK_MAX_BUFFER_AHEAD_SECONDS
     ) {
       // A route switch cannot repair a decoder/compositor/player-clock stall
       // when media covering the playhead is already available. Treating this
@@ -2416,6 +2456,7 @@
         reason: type,
         bufferAhead,
         readyState,
+        playbackRate: Number(video.playbackRate) || 1,
         seeking: Boolean(video.seeking)
       })
       .then((response) => {
@@ -2489,10 +2530,10 @@
     ) {
       return false;
     }
-    targetSession.bufferingMs += Math.max(
-      0,
-      now - videoState.bufferingSince
-    );
+    const duration = Math.max(0, now - videoState.bufferingSince);
+    targetSession.bufferingMs += duration;
+    const metric = videoState.bufferingReason === "seek" ? "seekWaitMs" : videoState.bufferingReason === "startup" ? "startupWaitMs" : "rebufferMs";
+    targetSession[metric] = (targetSession[metric] || 0) + duration;
     videoState.bufferingSince = null;
     videoState.bufferingSignals.clear();
     videoState.playbackRiskEpisodeReported = false;
@@ -2551,7 +2592,6 @@
         videoBufferAhead(video) >
         videoState.playbackRiskBaselineBuffer + 0.5;
       if (
-        (Number.isFinite(readyState) && readyState >= 3) ||
         playbackAdvanced ||
         bufferAdvanced
       ) {
@@ -2721,6 +2761,7 @@
         kind: "video",
         mediaHost: "",
         bufferingSince: null,
+        bufferingReason: "startup",
         bufferingSignals: new Set(),
         playbackRiskEpisodeReported: false,
         waitingCount: 0,
@@ -2745,6 +2786,17 @@
   }
 
   function syncPlayerDetail(videoState, video) {
+    if (config?.settings?.globalEnabled && config.settings.acceleration?.enabled) {
+      const status = video.paused ? "paused" : video.seeking ? "seeking"
+        : videoState.bufferingSince !== null ? "waiting" : "playing";
+      const now = performance.now();
+      if (status !== videoState.sentPlaybackStatus || now - (videoState.sentPlaybackAt || 0) >= 5000) {
+        videoState.sentPlaybackStatus = status; videoState.sentPlaybackAt = now;
+        void chrome.runtime.sendMessage({ type: "PLAYBACK_STATUS", sessionId: session.id,
+          ...(Number.isInteger(routingTabId) ? { routingTabId } : {}), status,
+          bufferAhead: videoBufferAhead(video), playbackRate: Number(video.playbackRate) || 1 }).catch(() => {});
+      }
+    }
     if (!activatePlayer(video, videoState)) {
       return;
     }
@@ -2873,6 +2925,17 @@
       syncPlayerDetail(videoState, video);
       requestProbe(video.currentSrc || video.src);
     });
+    video.addEventListener("seeking", () => {
+      const videoState = videoStates.get(video);
+      if (videoState?.sessionId !== session.id) return;
+      closeBufferingInterval(videoState);
+      videoState.bufferingReason = "seek";
+    });
+    video.addEventListener("seeked", () => {
+      const videoState = videoStates.get(video);
+      if (videoState?.sessionId !== session.id || video.paused) return;
+      if (videoState.bufferingSince !== null) schedulePlaybackRisk("seek-waiting", video);
+    });
     video.addEventListener("waiting", () => {
       const videoState = videoStates.get(video);
       if (videoState?.sessionId !== session.id) {
@@ -2881,6 +2944,7 @@
       resolveVideoRoute(video, videoState);
       if (videoState.bufferingSince === null) {
         videoState.bufferingSince = performance.now();
+        if (video.seeking) videoState.bufferingReason = "seek";
         videoState.bufferingSignals.clear();
         videoState.playbackRiskEpisodeReported = false;
       }
@@ -2958,6 +3022,7 @@
         addEvent("first-playing", "", `${session.firstPlayingMs}ms`);
       }
       closeBufferingInterval(videoState);
+      videoState.bufferingReason = "playback";
       syncPlayerDetail(videoState, video);
       recordSession();
     });
@@ -2993,6 +3058,7 @@
       const videoState = videoStates.get(video);
       if (videoState?.sessionId === session.id) {
         clearPlaybackRisk(videoState);
+        closeBufferingInterval(videoState);
         syncPlayerDetail(videoState, video);
         scheduleHiddenIdleSuspend();
       }
@@ -3411,19 +3477,24 @@
     const capturedSessionId = session.id;
     const active = { controller, sessionId: capturedSessionId };
     activePageProbes.set(probeId, active);
-    const startedAt = performance.now();
-    const timeout = setTimeout(
-      () => controller.abort("page probe timeout"),
-      PAGE_PROBE_TIMEOUT_MS
-    );
-    void fetch(target.href, {
+    let startedAt = performance.now();
+    let timeout;
+    const leaseId = `probe:${probeId}`;
+    void chrome.runtime.sendMessage({ type: "ACQUIRE_TRANSFER", id: leaseId, kind: "probe",
+      sessionId: capturedSessionId, ...(Number.isInteger(routingTabId) ? { routingTabId } : {}) })
+      .then(grant => {
+        if (!grant?.ok || controller.signal.aborted || session.id !== capturedSessionId) throw new Error("Page probe cancelled");
+        startedAt = performance.now();
+        timeout = setTimeout(() => controller.abort("page probe timeout"), PAGE_PROBE_TIMEOUT_MS);
+        return fetch(target.href, {
       method: "GET",
       headers: { Range: `bytes=0-${PAGE_PROBE_BYTES - 1}` },
       credentials: "omit",
       cache: "no-store",
       redirect: "error",
       signal: controller.signal
-    })
+    });
+      })
       .then(async (response) => {
         const headersAt = performance.now();
         const bytes = await readPageProbeBody(response);
@@ -3465,6 +3536,8 @@
       })
       .finally(() => {
         clearTimeout(timeout);
+        void chrome.runtime.sendMessage({ type: "RELEASE_TRANSFER", id: leaseId, sessionId: capturedSessionId,
+          ...(Number.isInteger(routingTabId) ? { routingTabId } : {}) }).catch(() => {});
         if (activePageProbes.get(probeId) === active) {
           activePageProbes.delete(probeId);
         }

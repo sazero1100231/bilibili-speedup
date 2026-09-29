@@ -9,10 +9,15 @@ An unofficial extension for Chrome and Edge. It tests the CDN routes Bilibili pr
 ## Features
 
 - Tests and switches between available CDN routes automatically.
+- 1.1.23 keeps the native player and splits larger video Range requests across compatible CDN routes using observed transfer speed. Splitting stops when enough media is buffered.
+- Slow tails can retain received bytes and start at most one rescue copy per range. Audio, video and qualification probes share a budget of four managed requests per tab and eight across the extension.
+- Insufficient CDN capacity triggers a later reassessment. Playback status, seek waits and ordinary rebuffering are recorded separately.
 - Removes common tracking parameters and blocks selected telemetry and promotional content.
 - Stores local playback and CDN diagnostics to help investigate buffering.
 
 ## Install
+
+Parallel delivery applies to recognized VOD representations and validated closed ranges up to 8 MiB, through Fetch or asynchronous binary XHR. Audio and small requests are not subdivided; other requests retain existing behavior. Live streams and YouTube are outside this version's scope. Concurrency cannot exceed shared network capacity; the four/eight limits are conservative budgets, not officially published optimal values. Received-byte diagnostics exclude protocol overhead and in-flight bytes that the browser did not deliver.
 
 Chrome or Edge 120 or later is required.
 

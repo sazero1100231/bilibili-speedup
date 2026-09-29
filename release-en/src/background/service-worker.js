@@ -23,6 +23,7 @@ import {
   probeMediaPath
 } from "../lib/prober.js";
 import { ProbeScheduler } from "../lib/probe-scheduler.js";
+import { TransferBudget } from "../lib/transfer-budget.js";
 import {
   advanceHostCircuit,
   confirmHostRecovery,
@@ -44,6 +45,8 @@ const CONTENT_SCRIPT_IDS = Object.freeze([
 ]);
 const CONTENT_SCRIPT_FILES = new Set([
   "src/content/main-world.js",
+  "src/content/range-transport.js",
+  "src/content/xhr-transport.js",
   "src/content/bridge.js"
 ]);
 const OWN_RULE_MIN = 1000;
@@ -71,6 +74,7 @@ let runtimeMutationChain = Promise.resolve();
 let initializationPromise = Promise.resolve();
 const probeJobs = new Map();
 const probeScheduler = new ProbeScheduler();
+const transferBudget = new TransferBudget();
 const circuitTimers = new Map();
 const nativeBypassTimers = new Map();
 const sessionExpiryTimers = new Map();
@@ -202,6 +206,7 @@ function tabRouteConfig(tabId) {
       playbackSessionId: "",
       routingTabId: null,
       compatibleRoutes: {},
+      parallelRoutes: {},
       degradedRoutes: {},
       halfOpenRoutes: {}
     };
@@ -224,6 +229,9 @@ function tabRouteConfig(tabId) {
   return {
     playbackSessionId: tabSession.sessionId,
     routingTabId: tabId,
+    parallelRoutes: Object.fromEntries(
+      [...tabSession.parallelRoutes.entries()].map(([key, values]) => [key, values.filter(value => Date.now() - value.at < 90000).map(value => value.url)])
+    ),
     compatibleRoutes: Object.fromEntries(
       [...tabSession.compatibleRoutes.entries()].map(([key, urls]) => [
         key,
@@ -274,6 +282,7 @@ function routingResourceStats(tabId) {
     routes.map((route) => route.presentationId)
   );
   return {
+    ...transferBudget.stats(tabId),
     trackedTabs: tabPlaybackSessions.size,
     maxTrackedTabs: MAX_TRACKED_TABS,
     presentations: presentations.size,
@@ -758,7 +767,12 @@ async function reconcileContentScripts(settings) {
   const existingIds = existing.map((entry) => entry.id).sort();
   if (
     desiredIds.length === existingIds.length &&
-    desiredIds.every((id, index) => id === existingIds[index])
+    desiredIds.every((id, index) => id === existingIds[index]) &&
+    existing.every(entry => JSON.stringify(entry.js) === JSON.stringify(
+      entry.id === CONTENT_SCRIPT_IDS[0]
+        ? ["src/content/range-transport.js", "src/content/xhr-transport.js", "src/content/main-world.js"]
+        : ["src/content/bridge.js"]
+    ))
   ) {
     return;
   }
@@ -789,7 +803,7 @@ async function reconcileContentScripts(settings) {
     registrations.unshift({
       ...shared,
       id: CONTENT_SCRIPT_IDS[0],
-      js: ["src/content/main-world.js"],
+      js: ["src/content/range-transport.js", "src/content/xhr-transport.js", "src/content/main-world.js"],
       world: "MAIN"
     });
   }
@@ -833,6 +847,7 @@ function createPlaybackSession(
     pageUrl: String(pageUrl ?? "").slice(0, 600),
     routes: new Map(),
     compatibleRoutes: new Map(),
+    parallelRoutes: new Map(),
     // Compatibility is not enough for a high-bitrate representation. Keep
     // the measured capacity beside each exact signed URL so a later manifest
     // update cannot retain a candidate that was authorized while bandwidth
@@ -943,6 +958,7 @@ async function evictPlaybackSession(
   clearTimeout(sessionExpiryTimers.get(tabId));
   sessionExpiryTimers.delete(tabId);
   probeScheduler.cancelTab(tabId, reason);
+  transferBudget.drop(session.sessionId);
   clearCircuitTimersForTab(tabId);
   clearNativeBypassTimersForTab(tabId);
   sessionTabBindings.delete(session.sessionId);
@@ -1200,6 +1216,7 @@ function rememberProbeReference(session, stateKey, evidence) {
     session.probeCandidateCursors.delete(stateKey);
     session.probeCandidateStates.delete(stateKey);
     session.compatibleRoutes.delete(stateKey);
+    session.parallelRoutes.delete(stateKey);
     session.compatibleRouteThroughputs.delete(stateKey);
   }
   session.probeReferences.set(stateKey, {
@@ -1764,6 +1781,18 @@ async function performProbe(
       entry.compatible &&
       !currentlyBlockedHosts.has(entry.host)
   );
+  // Content identity permits participating in a striped transfer even when a
+  // single candidate cannot sustain the entire representation by itself.
+  const earlierParallel = registeredRoute
+    ? (tabSession.parallelRoutes.get(stateKey) || []).filter(entry => Date.now() - entry.at < 90000) : [];
+  if (registeredRoute) {
+    const measuredUrls = new Set(result.results.filter(entry => entry.source === "pool").map(entry => entry.targetUrl));
+    const parallel = [
+      ...compatiblePoolResults.map(entry => ({ url: entry.targetUrl, at: Date.now() })),
+      ...earlierParallel.filter(entry => !measuredUrls.has(entry.url))
+    ].filter((entry, index, all) => all.findIndex(other => other.url === entry.url) === index).slice(0, 8);
+    tabSession.parallelRoutes.set(stateKey, parallel);
+  }
   const underpoweredPoolResults = compatiblePoolResults.filter(
     (entry) => !routeProbeHasCapacity(entry, requiredBps)
   );
@@ -1916,10 +1945,8 @@ async function performProbe(
     lastProbeAt: Date.now()
   }));
   if (recovery && poolExhausted) {
-    // The bridge may choose a session-long capacity bypass, or only a finite
-    // retry when every candidate failed for a transient reason. In either
-    // case the completed sweep must not make a later finite retry a zero-work
-    // loop over permanently "seen" hosts.
+    // A completed sweep must not turn the bridge's finite recovery retry into
+    // a zero-work loop over permanently "seen" hosts.
     tabSession.probeCandidateStates.delete(stateKey);
     tabSession.probeCandidateCursors.set(stateKey, 0);
   }
@@ -2435,8 +2462,7 @@ async function notePlaybackRisk(message, sender) {
   const bufferAhead = Math.max(0, Number(message.bufferAhead) || 0);
   const readyState = Math.max(0, Number(message.readyState) || 0);
   if (
-    bufferAhead > NETWORK_RISK_MAX_BUFFER_AHEAD_SECONDS ||
-    readyState >= 3
+    bufferAhead / Math.max(0.25, Number(message.playbackRate) || 1) > NETWORK_RISK_MAX_BUFFER_AHEAD_SECONDS
   ) {
     return {
       sessionId: session.sessionId,
@@ -2717,6 +2743,10 @@ function sanitizeSession(input) {
     waitingCount: Math.max(0, Number(input.waitingCount) || 0),
     stalledCount: Math.max(0, Number(input.stalledCount) || 0),
     bufferingMs: Math.max(0, Number(input.bufferingMs) || 0),
+    rebufferMs: Math.max(0, Number(input.rebufferMs) || 0),
+    startupWaitMs: Math.max(0, Number(input.startupWaitMs) || 0),
+    seekWaitMs: Math.max(0, Number(input.seekWaitMs) || 0),
+    transfers: sanitizeResourceStats(input.transfers),
     playbackSeconds: Math.max(0, Number(input.playbackSeconds) || 0),
     mediaHost: String(input.mediaHost ?? "").slice(0, 255),
     plannedMediaHost: String(input.plannedMediaHost ?? "").slice(0, 255),
@@ -3133,6 +3163,42 @@ async function handleMessage(message, sender) {
       }
       return { config: await buildRuntimeConfig(state, tabId) };
     }
+    case "GET_TAB_PLAYBACK_STATUS": {
+      if (!String(sender.url || "").startsWith(chrome.runtime.getURL("src/ui/"))) throw new Error("Extension UI required");
+      const session = tabPlaybackSessions.get(Number(message.tabId));
+      return { playback: session?.playbackStatus || null, transfer: session?.transferStatus || null };
+    }
+    case "PLAYBACK_STATUS": {
+      const { session } = requirePlaybackSession(message, sender);
+      if (["playing", "waiting", "seeking", "paused"].includes(message.status)) session.playbackStatus = {
+        status: message.status, bufferAhead: Math.min(600, Math.max(0, Number(message.bufferAhead) || 0)),
+        playbackRate: Math.min(16, Math.max(0.25, Number(message.playbackRate) || 1)), at: Date.now()
+      };
+      return {};
+    }
+    case "TRANSFER_RESULT": {
+      const { session } = requirePlaybackSession(message, sender);
+      if (message.kind !== "audio") session.transferStatus = {
+        outcome: ["complete", "cancelled", "error"].includes(message.outcome) ? message.outcome : "error",
+        hostCount: Math.min(8, Math.max(0, Number(message.hostCount) || 0)), at: Date.now()
+      };
+      return {};
+    }
+    case "ACQUIRE_TRANSFER": {
+      await requireRoutingEnabled();
+      const { tabId, sessionId } = requirePlaybackSession(message, sender);
+      const lease = await transferBudget.acquire(tabId, sessionId, String(message.id || ""), String(message.kind || "video"));
+      if (tabPlaybackSessions.get(tabId)?.sessionId !== sessionId) {
+        transferBudget.release(sessionId, message.id);
+        throw new Error("Transfer session ended");
+      }
+      return { sessionId, lease };
+    }
+    case "RELEASE_TRANSFER": {
+      const { sessionId } = requirePlaybackSession(message, sender);
+      transferBudget.release(sessionId, String(message.id || ""));
+      return { sessionId };
+    }
     case "START_PLAYBACK_SESSION": {
       const state = await requireRoutingEnabled();
       const { tabId, session } = await startPlaybackSession(message, sender);
@@ -3326,6 +3392,7 @@ function clearPlaybackRoutingState() {
     clearTimeout(timer);
   }
   sessionExpiryTimers.clear();
+  for (const session of tabPlaybackSessions.values()) transferBudget.drop(session.sessionId);
   tabPlaybackSessions.clear();
   reservedTabStarts.clear();
   tabSessionStartChains.clear();
@@ -3384,6 +3451,7 @@ chrome.tabs?.onRemoved?.addListener((tabId) => {
   clearNativeBypassTimersForTab(tabId);
   const session = tabPlaybackSessions.get(tabId);
   if (session) {
+    transferBudget.drop(session.sessionId);
     sessionTabBindings.delete(session.sessionId);
     tabPlaybackSessions.delete(tabId);
   }

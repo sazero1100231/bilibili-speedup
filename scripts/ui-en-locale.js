@@ -13,6 +13,12 @@
 // build rather than shipping mixed-language text.
 
 export const TRANSLATIONS = Object.freeze({
+  "播放加速已停用": "Playback acceleration is disabled",
+  "正在載入新的播放位置": "Loading the new playback position",
+  "播放正在等待資料；正在評估可用路徑": "Playback is waiting for data; evaluating available routes",
+  "影片已暫停": "Playback is paused",
+  "影片正在播放；依緩衝需求調整傳輸": "Video is playing; adjusting transfers to buffer demand",
+  "尚無目前分頁的播放狀態；節點測速不代表播放已恢復": "No playback status for this tab yet; a node speed test does not confirm playback recovery",
   // Full sentences (options descriptions, endpoint rationale/side-effect).
   "擴充功能目前已停用；請先在設定中啟用，診斷才會開始記錄。":
     "The extension is disabled. Enable it in Settings before diagnostics can record.",
