@@ -11,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { playbackObserverSource } from "../support/playback-observer.js";
 import {
   contentIdentityFromUrl,
   evaluateLiveContentMatrix,
@@ -21,7 +22,7 @@ const projectRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "../.."
 );
-const extensionRoot = process.argv.includes("--release")
+const extensionRoot = process.env.BILIBILI_SOAK_EXTENSION_ROOT ? path.resolve(process.env.BILIBILI_SOAK_EXTENSION_ROOT) : process.argv.includes("--release")
   ? path.join(projectRoot, "release")
   : projectRoot;
 const browserCandidates = [
@@ -34,6 +35,7 @@ const browserPath = browserCandidates.find(existsSync);
 const headful = process.env.E2E_HEADFUL === "1";
 const nativeMode = process.env.BILIBILI_SOAK_NATIVE === "1";
 const passiveMode = process.env.BILIBILI_SOAK_PASSIVE === "1";
+const journeyMode = process.env.BILIBILI_SOAK_JOURNEY === "1";
 const durationSeconds = boundedNumber(
   process.env.BILIBILI_SOAK_SECONDS,
   1800,
@@ -483,6 +485,7 @@ const visits = [];
 const samples = [];
 const seekResults = [];
 const qualityAttempts = [];
+const functionalActions = [];
 const navigationEvents = { full: 0, spa: 0 };
 let verifiedSpaNavigations = 0;
 let browser;
@@ -515,12 +518,10 @@ try {
             "--headless=new",
             "--disable-gpu",
             "--disable-gpu-compositing",
-            "--disable-gpu-sandbox",
             "--use-gl=angle",
             "--use-angle=swiftshader"
           ]),
-      "--no-sandbox",
-      "--remote-allow-origins=*",
+      "--mute-audio",
       "--enable-automation",
       "--no-first-run",
       "--no-default-browser-check",
@@ -585,11 +586,17 @@ try {
         throw new Error(response?.error ?? "runtime settings unavailable");
       }
       const settings = structuredClone(response.config.settings);
+      if (${journeyMode}) {
+        const registrations = await chrome.scripting.getRegisteredContentScripts();
+        const main = registrations.find(entry => entry.world === "MAIN");
+        if (main) await chrome.scripting.updateContentScripts([{ id: main.id, js: ["src/content/main-world.js"] }]);
+      }
       settings.diagnostics.enabled = true;
       await chrome.storage.local.set({ settings });
       return true;
     })()`);
     await sleep(100);
+    if (journeyMode) functionalActions.push({ action: "upgrade-registration", scripts: await control.evaluate(`chrome.scripting.getRegisteredContentScripts().then(entries => entries.map(entry => ({world: entry.world, js: entry.js})))`) });
   }
 
   const pageTarget = (await targetInfos(client)).find(
@@ -603,7 +610,16 @@ try {
   });
   page = new CdpSession(client, pageAttachment.sessionId);
   await page.send("Page.enable");
+  const commandLine = await client.send("Browser.getBrowserCommandLine");
+  assert.ok(commandLine.arguments.includes("--mute-audio"), "Acceptance browser must be muted before navigation");
+  await page.send("Page.addScriptToEvaluateOnNewDocument", { source: `(() => {
+    const mute = () => document.querySelectorAll('video,audio').forEach(media => { media.muted = true; media.defaultMuted = true; });
+    new MutationObserver(mute).observe(document, { childList: true, subtree: true });
+    document.addEventListener('play', mute, true);
+    mute();
+  })();` });
   await page.send("Runtime.enable");
+  await page.send("Page.addScriptToEvaluateOnNewDocument", { source: playbackObserverSource });
   await page.send("Network.enable");
   await page.send("Performance.enable");
   await page.send("Page.bringToFront").catch(() => {});
@@ -949,6 +965,8 @@ try {
           url: location.origin + location.pathname,
           bvid: location.pathname.match(/\\/video\\/(BV[0-9A-Za-z]{10})/i)?.[1] ?? "",
           title: document.title.slice(0, 200),
+          rendered: globalThis.__biliAcceptanceSnapshot?.(video) || null,
+          quality: globalThis.player?.getQuality?.() || null,
           visibilityState: document.visibilityState,
           hasFocus: document.hasFocus(),
           videoCandidates: videos.slice(0, 4).map(candidate => ({
@@ -971,6 +989,7 @@ try {
                 paused: video.paused,
                 seeking: video.seeking,
                 ended: video.ended,
+                muted: video.muted,
                 playbackRate: video.playbackRate,
                 defaultPlaybackRate: video.defaultPlaybackRate,
                 readyState: video.readyState,
@@ -1080,13 +1099,16 @@ try {
               .evaluate(
                 `(() => {
                   const url = new URL(location.href);
-                  if (!url.pathname.includes(${JSON.stringify(
-                    `/video/${clickedPart.bvid}`
-                  )})) return false;
                   if (${JSON.stringify(clickedPart.mode)} === "part-url") {
+                    if (!url.pathname.includes(${JSON.stringify(
+                      `/video/${clickedPart.bvid}`
+                    )})) return false;
                     return url.searchParams.get("p") === ${JSON.stringify(
                       clickedPart.token
                     )};
+                  }
+                  if (!url.pathname.includes(${JSON.stringify(`/video/${clickedPart.bvid}`)})) {
+                    return /\\/video\\/BV[0-9A-Za-z]{10}/i.test(url.pathname);
                   }
                   const active = document.querySelector(
                     ".video-pod__item.active[data-key]"
@@ -1104,8 +1126,9 @@ try {
         ).catch(() => false);
         if (reached) {
           verifiedSpaNavigations += 1;
+          const reachedBvid = await page.evaluate(`location.pathname.match(/\\/video\\/(BV[0-9A-Za-z]{10})/i)?.[1] || ""`);
           return {
-            bvid: clickedPart.bvid,
+            bvid: reachedBvid || clickedPart.bvid,
             consumedRequested: false
           };
         }
@@ -1182,7 +1205,7 @@ try {
     const requestedTarget = queue[queueIndex % queue.length];
     const requestedBvid = requestedTarget.bvid;
     const preferSpa =
-      Boolean(requestedBvid) && visits.length > 0 && visits.length % 3 === 0;
+      Boolean(requestedBvid) && visits.length > 0 && (journeyMode || visits.length % 3 === 0);
     const fullBefore = navigationEvents.full;
     const spaBefore = navigationEvents.spa;
     const visitStartedAt = Date.now();
@@ -1263,6 +1286,28 @@ try {
     );
     while (videoFound && Date.now() < visitDeadline) {
       const elapsed = Date.now() - (visit.readyAt ?? visitStartedAt);
+      if (journeyMode && visits.length === 1 && elapsed >= 5000 && !visit.rateJourney) {
+        visit.rateJourney = true;
+        functionalActions.push(await page.evaluate(`(async () => {
+          const video = document.querySelector('video');
+          const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+          const before = video.currentTime; video.pause(); await wait(800);
+          const pauseDrift = video.currentTime - before;
+          video.muted = true; await video.play(); video.playbackRate = 2;
+          const rateStart = video.currentTime; await wait(2000);
+          const rateAdvance = video.currentTime - rateStart; video.playbackRate = 1;
+          return { action: 'pause-resume-2x', pauseDrift, rateAdvance, restoredRate: video.playbackRate, muted: video.muted, error: video.error?.code || 0 };
+        })()`));
+      }
+      if (journeyMode && visits.length === 1 && elapsed >= Number(process.env.BILIBILI_SOAK_TOGGLE_MS || 35000) && !visit.disableJourney) {
+        visit.disableJourney = true;
+        for (const enabled of [false, true]) {
+          const before = await pageSnapshot();
+          await control.evaluate(`(async () => { const {settings} = await chrome.storage.local.get('settings'); settings.acceleration.enabled = ${enabled}; await chrome.storage.local.set({settings}); })()`);
+          await sleep(2000);
+          functionalActions.push({ action: enabled ? "enable-acceleration" : "disable-acceleration", before, after: await pageSnapshot(), extension: await controlSnapshot() });
+        }
+      }
       if (
         !passiveMode &&
         !visit.seekAttempted &&
@@ -1352,7 +1397,8 @@ try {
                       (video || player) &&
                       !video?.error &&
                       !video?.seeking &&
-                      currentTime >= ${JSON.stringify(seek.target - 0.5)}
+                      !video?.paused && video?.readyState >= 3 &&
+                      currentTime >= ${JSON.stringify(seek.target + 0.1)}
                     );
                   })()`)
                   .catch(() => false),
@@ -1549,6 +1595,10 @@ try {
       await sleep(
         Math.min(sampleSeconds * 1000, Math.max(0, visitDeadline - Date.now()))
       );
+    }
+    if (process.env.BILIBILI_SOAK_SCREENSHOTS === "1" && videoFound) {
+      const screenshot = await page.send("Page.captureScreenshot", { format: "png" });
+      writeFileSync(reportPath.replace(/\.json$/, `-visit-${visits.length}.png`), Buffer.from(screenshot.data, "base64"));
     }
     if (consumedRequested) {
       queueIndex += 1;
@@ -1847,6 +1897,7 @@ try {
       stderrTail: stderr.join("").slice(-10000),
       pageErrors
     },
+    functionalActions,
     coverage: {
       visits: visits.length,
       uniqueVisitedBvids,

@@ -1,6 +1,13 @@
 (() => {
   "use strict";
 
+  const rangeFactory = window.__BILI_SPEEDUP_RANGE_FACTORY__;
+  const xhrFactory = window.__BILI_SPEEDUP_XHR_FACTORY__;
+  delete window.__BILI_SPEEDUP_RANGE_FACTORY__;
+  delete window.__BILI_SPEEDUP_XHR_FACTORY__;
+  let rangeTransport = null;
+  let restoreRangeXhr = null;
+  const transferWaiters = new Map();
   const CHANNEL = "bilibili-speedup";
   const INIT_EVENT = `${CHANNEL}:init`;
   const READY_EVENT = `${CHANNEL}:ready`;
@@ -92,6 +99,7 @@
       replaceState: false
     },
     navigationKey: "",
+    disabledRouteInventory: null,
     pristineHistory: {},
     lifecycleActive: true
   };
@@ -636,6 +644,7 @@
   }
 
   function resetPlaybackRouting() {
+    rangeTransport?.cancelAll();
     state.routingGeneration += 1;
     for (const waiter of state.policyWaiters.values()) {
       clearTimeout(waiter.timer);
@@ -671,6 +680,7 @@
     state.presentationCapacityDiagnosticScheduled = false;
     state.presentationCapacityDiagnosticEmitted = false;
     state.config.compatibleRoutes = {};
+    state.config.parallelRoutes = {};
     state.config.degradedRoutes = {};
   }
 
@@ -1638,6 +1648,82 @@
     throw lastError ?? new Error("No eligible media route");
   }
 
+  function transportPlayback(route) {
+    const videos = [...(document.querySelectorAll?.("video") || [])];
+    const video = videos.length === 1 ? videos[0] : videos.find(item => !item.paused);
+    return { buffer: bufferAheadSeconds(route.routeKey) || 0,
+      rate: Math.max(0.25, Number(video?.playbackRate) || 1), paused: Boolean(video?.paused) };
+  }
+
+  function acquireTransfer(id, kind, signal) {
+    return new Promise((resolve, reject) => {
+      const cancel = () => {
+        const pending = transferWaiters.get(id);
+        if (!pending) return;
+        transferWaiters.delete(id); clearTimeout(pending.timer);
+        emit("TRANSFER_RELEASE", { id });
+        reject(new DOMException("Transfer cancelled", "AbortError"));
+      };
+      const timer = setTimeout(() => {
+        transferWaiters.delete(id); signal.removeEventListener("abort", cancel);
+        emit("TRANSFER_RELEASE", { id });
+        reject(new Error("Transfer budget unavailable"));
+      }, 11000);
+      transferWaiters.set(id, { resolve, reject, timer, cancel, signal });
+      signal.addEventListener("abort", cancel, { once: true });
+      if (signal.aborted) cancel();
+      else emit("TRANSFER_ACQUIRE", { id, kind });
+    });
+  }
+
+  function transportPlan(rawUrl) {
+    if (!rangeTransport || !playurlRewriteEnabled() || !isMediaUrl(rawUrl)) return null;
+    const route = findMediaRoute(rawUrl);
+    if (!route || !presentationIsActive(route.presentationId)) return null;
+    const identity = routeIdentity(route.presentationId, route.routeKey);
+    const urls = unique([
+      ...(state.config.parallelRoutes?.[identity] || []),
+      ...compatibleRouteUrls(route.routeKey, route.presentationId),
+      ...route.originalUrls
+    ]).filter(url => isMediaUrl(url) && mediaKey(url) === route.routeKey && !isBlockedHost(new URL(url).hostname));
+    const requested = new URL(rawUrl, location.href).href;
+    const acceleration = state.config.settings.acceleration;
+    if (acceleration.strategy === "manual" && acceleration.manualHost) {
+      const manual = [requested, ...urls].find(value => new URL(value).hostname === acceleration.manualHost);
+      return manual ? { url: manual, route, urls: [manual] } : null;
+    }
+    return { url: requested, route, urls };
+  }
+
+  function installRangeTransport() {
+    if (!rangeFactory || !xhrFactory || typeof ReadableStream !== "function") return;
+    rangeTransport ||= rangeFactory.create({
+      fetch: (url, init) => state.originals.fetch.call(window, url, init),
+      allowed: url => isAllowedMediaUrl(url) && !isBlockedHost(new URL(url).hostname),
+      playback: transportPlayback,
+      acquire: acquireTransfer,
+      release: id => emit("TRANSFER_RELEASE", { id }),
+      onResult: result => {
+        emit("MEDIA_TRANSFER_RESULT", result);
+        if (result.outcome === "complete") {
+          const route = [...state.mediaRoutes.values()].find(item => item.presentationId === result.presentationId && item.routeKey === result.routeKey);
+          if (route && result.hosts.length) {
+            const actual = [...route.urls, ...route.originalUrls, ...(state.config.parallelRoutes?.[routeIdentity(route.presentationId, route.routeKey)] || [])]
+              .find(url => new URL(url).hostname === result.hosts[0]);
+            if (actual) reportActualMediaHost(actual, true, route);
+          }
+        }
+      }
+    });
+    restoreRangeXhr = xhrFactory.install({
+      plan: request => transportPlan(request.url),
+      start: request => {
+        emitProbeForRoute(request.route, request.url);
+        return rangeTransport.start(request);
+      }
+    });
+  }
+
   function createFetchWrapper() {
     return async function biliFetch(input, init) {
       const rawUrl = rawRequestUrl(input);
@@ -1674,6 +1760,17 @@
           return rewriteFetchResponse(response, rawUrl);
         }
         if (isMediaUrl(rawUrl)) {
+          const plan = transportPlan(rawUrl);
+          if (plan) {
+            const request = new Request(input, init);
+            if (request.method === "GET" && request.credentials !== "include" && request.mode !== "no-cors" && !request.integrity) {
+              const transfer = rangeTransport.start({ ...plan, headers: request.headers, signal: request.signal });
+              if (transfer) {
+                emitProbeForRoute(plan.route, rawUrl);
+                return transfer.response;
+              }
+            }
+          }
           const route = findMediaRoute(rawUrl);
           if (
             route &&
@@ -2223,7 +2320,7 @@
               return;
             }
             const bufferAhead = bufferAheadSeconds(meta.routeKey);
-            const bandwidth = Number(meta.route?.bandwidth) || 0;
+            const bandwidth = (Number(meta.route?.bandwidth) || 0) * transportPlayback(meta.route || {}).rate;
             const expectedBytes = xhrExpectedBytes(this, meta);
             const remainingBytes = Math.max(0, expectedBytes - meta.loaded);
             const elapsedMs = Math.max(
@@ -2299,7 +2396,7 @@
             scheduleStallWatchdog();
           }
           const elapsedMs = progressAt - meta.startedAt;
-          const bandwidth = Number(meta.route?.bandwidth) || 0;
+          const bandwidth = (Number(meta.route?.bandwidth) || 0) * transportPlayback(meta.route || {}).rate;
           const bufferAhead = bufferAheadSeconds(meta.routeKey);
           if (elapsedMs < 1500 || !bandwidth || bufferAhead === null) {
             return;
@@ -2637,6 +2734,7 @@
     navigator.sendBeacon = state.wrappers.sendBeacon;
     installBootstrapPlayinfoHook();
     installXhrHooks();
+    installRangeTransport();
     installClipboardHook();
     state.wrappers.popstate = () => {
       if (state.config.settings.globalEnabled) {
@@ -2665,6 +2763,9 @@
   }
 
   function restoreHooks() {
+    rangeTransport?.cancelAll();
+    restoreRangeXhr?.();
+    restoreRangeXhr = null;
     if (!state.installed) {
       return;
     }
@@ -2798,10 +2899,20 @@
       config.settings.globalEnabled &&
         config.settings.acceleration.enabled
     );
+    if (wasRoutingEnabled && !willRoute) {
+      state.disabledRouteInventory = {
+        page: playbackNavigationKey(location.href), at: Date.now(),
+        routes: [...state.mediaRoutes.values()].filter(route => presentationIsActive(route.presentationId))
+          .slice(0, 64).map(route => ({ ...route, urls: [...route.originalUrls] }))
+      };
+    }
+    const resumeInventory = willRoute && !wasRoutingEnabled ? state.disabledRouteInventory : null;
+    if (willRoute && !wasRoutingEnabled) state.disabledRouteInventory = null;
     if (!willRoute || !wasRoutingEnabled) {
       // Disabling and re-enabling are both generation boundaries. Page-local
       // routes and failures must not outlive the service-worker session reset.
       resetPlaybackRouting();
+      if (willRoute) state.bootstrapPlayinfo.processedRevision = -1;
     }
     // Rewrite targets are re-validated here so that no upstream layer — rule
     // file, storage state, or a compromised channel — can steer media requests
@@ -2828,6 +2939,15 @@
       }
     }
     config.compatibleRoutes = compatibleRoutes;
+    const parallelRoutes = {};
+    for (const [key, values] of Object.entries(config.parallelRoutes || {}).slice(0, 64)) {
+      const separator = key.indexOf("::");
+      if (separator < 0) continue;
+      const routeKey = key.slice(separator + 2);
+      parallelRoutes[key] = unique(Array.isArray(values) ? values : []).filter(url =>
+        typeof url === "string" && url.length <= 4096 && isMediaUrl(url) && mediaKey(url) === routeKey).slice(0, 8);
+    }
+    config.parallelRoutes = parallelRoutes;
     state.config = config;
     const authoritativeBlockedRoutes = new Map();
     for (const [routeKey, hosts] of Object.entries(
@@ -2888,6 +3008,20 @@
       });
     }
     refreshBootstrapPlayinfo();
+    // Some player builds have no bootstrap playinfo and keep their manifest
+    // inside the player. Re-register its recent original URLs after a toggle;
+    // no old failure, synthesized candidate or cross-page policy is restored.
+    if (resumeInventory && resumeInventory.page === playbackNavigationKey(location.href)
+      && Date.now() - resumeInventory.at < 120000) {
+      const resumed = [];
+      for (const route of resumeInventory.routes) {
+        if (!presentationIsActive(route.presentationId) || !canTrackRoute(route.presentationId, route.routeKey)) continue;
+        const identity = routeIdentity(route.presentationId, route.routeKey);
+        if (!state.mediaRoutes.has(identity)) state.mediaRoutes.set(identity, route);
+        resumed.push(state.mediaRoutes.get(identity));
+      }
+      void emitRouteManifest(resumed);
+    }
     for (const route of state.mediaRoutes.values()) {
       route.urls = unique([
         ...route.urls,
@@ -2926,8 +3060,17 @@
         const message = JSON.parse(String(privateEvent.detail ?? ""));
         if (message.type === "CONFIG") {
           applyConfig(message.payload);
+        } else if (message.type === "TRANSFER_GRANTED") {
+          const pending = transferWaiters.get(message.payload?.id);
+          if (pending) {
+            transferWaiters.delete(message.payload.id); clearTimeout(pending.timer);
+            pending.signal.removeEventListener("abort", pending.cancel);
+            if (message.payload.ok) pending.resolve();
+            else pending.reject(new Error("Transfer budget unavailable"));
+          } else if (message.payload?.ok) emit("TRANSFER_RELEASE", { id: message.payload.id });
         } else if (message.type === "LIFECYCLE") {
           state.lifecycleActive = message.payload?.active !== false;
+          if (!state.lifecycleActive) rangeTransport?.cancelAll();
         } else if (message.type === "ROUTE_POLICY_READY") {
           acknowledgePolicyReady(message.payload?.requestId);
         } else if (message.type === "ROUTE_NATIVE_BYPASS") {

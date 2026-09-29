@@ -695,7 +695,7 @@ test("a qualified recovery route restores the temporary native bypass", async ()
   );
 });
 
-test("an underpowered recovery sweep persists exact-route bypass without a probe storm", async () => {
+test("an underpowered recovery sweep uses finite cooldown without a probe storm", async () => {
   const presentationId = "bvid-BV1234567890";
   const routeKey = "/path/sweep.m4s";
   const routeId = `${presentationId}::${routeKey}`;
@@ -711,10 +711,6 @@ test("an underpowered recovery sweep persists exact-route bypass without a probe
     },
     cosmeticSelectors: [],
     compatibleRoutes: { [routeId]: [] }
-  });
-  let resolvePersistentBypass;
-  const persistentBypass = new Promise((resolve) => {
-    resolvePersistentBypass = resolve;
   });
   const harness = await createHarness({
     pageUrl: "https://www.bilibili.com/video/BV1234567890",
@@ -745,9 +741,6 @@ test("an underpowered recovery sweep persists exact-route bypass without a probe
         });
       }
       if (message.type === "BYPASS_PLAYBACK_ROUTE") {
-        if (message.persistent === true) {
-          return persistentBypass;
-        }
         return Promise.resolve({
           ok: true,
           sessionId: message.sessionId,
@@ -800,36 +793,17 @@ test("an underpowered recovery sweep persists exact-route bypass without a probe
     ),
     false
   );
-  const persistentRequest = harness.messages.find(
-    (message) =>
-      message.type === "BYPASS_PLAYBACK_ROUTE" &&
-      message.persistent === true
-  );
-  resolvePersistentBypass({
-    ok: true,
-    sessionId: persistentRequest.sessionId,
-    presentationId,
-    routeKey,
-    persistent: true,
-    ruleCount: 0
-  });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.ok(
-    harness.mainMessages.some(
-      (message) =>
-        message.type === "ROUTE_NATIVE_BYPASS" &&
-        message.payload.presentationId === presentationId &&
-        message.payload.routeKey === routeKey &&
-        message.payload.persistent === true
-    )
-  );
+  assert.equal(harness.messages.some(message =>
+    message.type === "BYPASS_PLAYBACK_ROUTE" && message.persistent === true), false);
+  assert.ok(harness.mainMessages.some(message =>
+    message.type === "ROUTE_NATIVE_BYPASS" && Number.isFinite(message.payload.until)));
 
   harness.emitMainMessage("MEDIA_DEGRADED", degraded);
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(harness.probeMessages().length, 4);
 });
 
-test("a rejected persistent bypass acknowledgement never leaves page state at Infinity", async (t) => {
+test("a rejected finite bypass acknowledgement never leaves page state at Infinity", async (t) => {
   for (const failureMode of ["ok-false", "reject"]) {
     await t.test(failureMode, async () => {
       const presentationId = "bvid-BV1234567890";
@@ -878,7 +852,7 @@ test("a rejected persistent bypass acknowledgement never leaves page state at In
           }
           if (
             message.type === "BYPASS_PLAYBACK_ROUTE" &&
-            message.persistent === true
+            message.persistent === false
           ) {
             return failureMode === "reject"
               ? Promise.reject(new Error("synthetic bypass rejection"))
@@ -937,7 +911,7 @@ test("a rejected persistent bypass acknowledgement never leaves page state at In
             message.type === "BYPASS_PLAYBACK_ROUTE" &&
             message.persistent === true
         ).length,
-        1
+        0
       );
       assert.equal(
         harness.mainMessages.some(
@@ -1102,13 +1076,13 @@ test("a recovery byte-budget rejection defers one route retry without declaring 
         message.type === "BYPASS_PLAYBACK_ROUTE" &&
         message.persistent === true
     ).length,
-    1
+    0
   );
   assert.ok(
     harness.mainMessages.some(
       (message) =>
         message.type === "ROUTE_NATIVE_BYPASS" &&
-        message.payload.persistent === true
+        message.payload.persistent === false && Number.isFinite(message.payload.until)
     )
   );
 });
